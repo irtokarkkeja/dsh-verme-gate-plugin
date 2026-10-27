@@ -3333,15 +3333,18 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     const spendAnswer = await gatewayGet('/spend/logs?start_date=' + today + '&end_date=' + dayOf(tomorrowDate), key)
     let todaySpend = null
     let todayModels = []
+    let todayModelsTotal = 0
     if (Array.isArray(spendAnswer.body)) {
       const row = spendAnswer.body.find((entry) => entry !== null && entry !== undefined && String(entry.startTime || '') === today)
       if (row !== undefined && row !== null) {
         todaySpend = numOf(row.spend)
         const models = row.models !== null && row.models !== undefined && typeof row.models === 'object' ? row.models : {}
-        todayModels = Object.keys(models)
+        const allModels = Object.keys(models)
           .map((name) => ({ model: name, spend: numOf(models[name]) || 0 }))
           .sort((left, right) => right.spend - left.spend)
-          .slice(0, 3)
+        // Шлём запасом: обрезка до шести строк — на клиенте, чтобы менять вид без правки хоста.
+        todayModels = allModels.slice(0, 24)
+        todayModelsTotal = allModels.length
       } else if (spendAnswer.body.length > 0) {
         todaySpend = 0
       }
@@ -3384,7 +3387,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         budgetDuration: String(teamInfo.budget_duration || ''),
         resetAt: String(teamInfo.budget_reset_at || ''),
       },
-      today: todaySpend === null ? null : { day: today, spend: todaySpend, models: todayModels },
+      today: todaySpend === null ? null : { day: today, spend: todaySpend, models: todayModels, modelsTotal: todayModelsTotal },
       error: keyAnswer.error || userAnswer.error || teamAnswer.error || spendAnswer.error || '',
       fetchedAt: Date.now(),
     }
