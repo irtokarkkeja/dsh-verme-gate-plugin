@@ -311,7 +311,7 @@ function hostModuleUrl(spec, subpath = '') {
 }
 
 /** Диапазон DSH, на котором плагин проверен: ровно линия 0.2.1 (не 0.2.2-alpha — там не проверяли). */
-const DSH_TESTED_RANGE = '^0.2.1-rc.2'
+const DSH_TESTED_RANGE = '^0.2.1-rc.2 || ^0.2.2-alpha.2'
 /** Версия и каталог работающей DSH: нужны для честного вердикта совместимости и ошибок импорта. */
 const dshRuntime = detectDshRuntime()
 /**

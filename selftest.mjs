@@ -393,6 +393,9 @@ check('совместимость видна снаружи: /api/state.dsh и c
   source.includes('dsh: dshCompat,')
   && source.includes('const missingCapabilities = requiredCapabilities')
   && source.includes("'в этой сборке DSH нет: '"))
+check('диапазон проверки в коде совпадает с объявленным engines.dsh (одна правда, не две)',
+  source.includes("const DSH_TESTED_RANGE = '" + manifest.engines.dsh + "'")
+  && source.includes('checkDshCompat(dshRuntime.version, DSH_TESTED_RANGE)'))
 check('матрица прогонов: 4 версии DSH объявлены проверенными, глубина — в заметке',
   source.includes("const DSH_TESTED_VERSIONS = ['0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4', '0.2.2-alpha.2']")
   && source.includes('const DSH_TESTED_NOTE = ')
