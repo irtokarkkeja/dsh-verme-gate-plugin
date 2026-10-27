@@ -192,6 +192,13 @@ function shortDay(day) {
   return parts.length === 3 ? parts[2] + '.' + parts[1] : String(day)
 }
 
+/**
+ * Запрос к API плагина на своём origin с cookie; тело — JSON.
+ * @param {string} method - HTTP-метод.
+ * @param {string} path - путь API (например, "/state").
+ * @param {object} [body] - тело для POST.
+ * @returns {Promise<object>} разобранный ответ.
+ */
 function callApi(method, path, body) {
   const init = { method, headers: {}, credentials: 'same-origin' }
   if (body !== undefined) {
@@ -213,6 +220,11 @@ function callApi(method, path, body) {
   }))
 }
 
+/**
+ * Время метки в местной зоне как ЧЧ:ММ:СС; пустая метка — пустая строка.
+ * @param {string|number} stamp - ISO-время или эпоха.
+ * @returns {string} подпись времени.
+ */
 function clockOf(stamp) {
   if (!stamp) return ''
   const date = new Date(stamp)
@@ -239,16 +251,32 @@ const VERDICTS = {
   'token-unknown': { label: 'ключ не проверен', tone: 'warn' },
 }
 
+/**
+ * Вердикт по состоянию токена сервера: что именно не так с подключением.
+ * @param {object} server - сервер из /api/state.
+ * @returns {object|null} ярлык и тон вердикта либо null.
+ */
 function verdictOf(server) {
   return VERDICTS[server.tokenStatus] || null
 }
 
 // id для aria-controls раскрываемой панели сервера (имя сервера может быть любым).
+/**
+ * DOM-id панели по виду и имени сервера: имя санитайзится в ASCII для aria-controls.
+ * @param {string} kind - вид панели ("Tab"/"Panel").
+ * @param {string} name - имя сервера.
+ * @returns {string} id панели.
+ */
 function panelIdOf(kind, name) {
   return 'dshMcp' + kind + '-' + String(name || '').replace(/[^a-zA-Z0-9_-]/g, '-') + '-panel'
 }
 
 // Подсказка вердикта: причина и код от шлюза, возраст — по времени проверки.
+/**
+ * Подсказка к вердикту: чего серверу не хватает (env, заголовки, ключ).
+ * @param {object} server - сервер из /api/state.
+ * @returns {string} текст подсказки.
+ */
 function verdictHintOf(server) {
   const parts = []
   const login = String(server.tokenLogin || '')
@@ -263,6 +291,11 @@ function verdictHintOf(server) {
 }
 
 // Ответ /verify говорит, чем закончилась проверка: без этого экран писал «выполнена» и при отказе.
+/**
+ * Уведомление по результату проверки подключений (payload.verify).
+ * @param {object|null} payload - ответ /api/verify.
+ * @returns {string} текст уведомления.
+ */
 function verifyNoticeOf(payload) {
   const list = payload !== null && payload !== undefined && Array.isArray(payload.verify) ? payload.verify : []
   if (list.length === 0) return { text: 'Проверка не выполнена.', tone: 'warn' }
@@ -278,17 +311,33 @@ function verifyNoticeOf(payload) {
   return { text: 'Проверка не выполнена.', tone: 'warn' }
 }
 
+/**
+ * Пилюля-статус с тоном оформления.
+ * @param {string} text - текст.
+ * @param {string} [tone] - тон ("ok"/"warn"/"err"/"idle").
+ * @returns {object} элемент.
+ */
 function pill(text, tone) {
   return h('span', { className: 'dshMcpPill dshMcpPill--' + (tone || 'idle') },
     h('span', { className: 'dshMcpDot', 'aria-hidden': 'true' }), text)
 }
 
+/**
+ * Разрешённые токену имена тулзов сервера (allow-list).
+ * @param {object} server - сервер из /api/state.
+ * @returns {string[]|null} имена либо null, если ограничения нет.
+ */
 function allowListOf(server) {
   const allow = Array.isArray(server.toolAllow) ? server.toolAllow : []
   if (allow.indexOf('*') !== -1) return null
   return allow
 }
 
+/**
+ * Тулзы, реально полученные от MCP-сервера при его подключении.
+ * @param {object} server - сервер из /api/state.
+ * @returns {object[]} полученные тулзы.
+ */
 function obtainedToolsOf(server) {
   const raw = Array.isArray(server.mountedTools) ? server.mountedTools : []
   const prefix = 'mcp__' + String(server.name) + '__'
@@ -298,6 +347,11 @@ function obtainedToolsOf(server) {
   }))
 }
 
+/**
+ * Полученные тулзы, которые токен разрешает (пересечение с allow-list).
+ * @param {object} server - сервер из /api/state.
+ * @returns {object[]} доступные тулзы.
+ */
 function allowedToolsOf(server) {
   const obtained = obtainedToolsOf(server)
   const allow = allowListOf(server)
@@ -305,12 +359,11 @@ function allowedToolsOf(server) {
   return obtained.filter((tool) => allow.indexOf(tool.id) !== -1)
 }
 
-function loginText(value) {
-  if (value === null || value === undefined) return ''
-  const text = String(value)
-  return text.indexOf('login=') === 0 ? text.slice(6) : text
-}
-
+/**
+ * Подпись текущей модели токена: "провайдер · модель" либо прочерк.
+ * @param {object|string|null} current - активная модель из /api/state.
+ * @returns {string} подпись.
+ */
 function currentModelText(current) {
   if (current === null || current === undefined) return ''
   if (typeof current === 'string') return current
@@ -333,12 +386,22 @@ const SERVER_STATES = {
   'not-mounted': { label: 'не подключён', tone: 'idle' },
 }
 
+/**
+ * Ярлык и тон статуса подключения сервера.
+ * @param {object} server - сервер из /api/state.
+ * @returns {{label: string, tone: string}} ярлык и тон.
+ */
 function serverStateOf(server) {
   return SERVER_STATES[server.status] || { label: 'Состояние не распознано', tone: 'idle' }
 }
 
 // Чего сервер не хватает: только имена (переменные шлюза и заголовки). Описание каждого
 // имени уходит в подсказку, в строке оно не печатается. Источник — объявление сервера.
+/**
+ * Чипы требований сервера: env-переменные, заголовки, прочие условия.
+ * @param {object} server - сервер из /api/state.
+ * @returns {object[]} элементы-чипы.
+ */
 function requirementChips(server) {
   const chips = []
   const envRequired = Array.isArray(server.envRequired) ? server.envRequired : []
@@ -361,6 +424,11 @@ function requirementChips(server) {
 }
 
 // Заголовки сервера: требования из записи шлюза плюс уже заданные значения (объединение по имени).
+/**
+ * Заголовки сервера с признаком «задан» — без значений (секреты не покидают хост).
+ * @param {object} server - сервер из /api/state.
+ * @returns {object[]} заголовки.
+ */
 function headerListOf(server) {
   const out = []
   const index = {}
@@ -383,6 +451,11 @@ function headerListOf(server) {
   return out
 }
 
+/**
+ * Строка-уведомление с тоном; пустой текст — ничего не рисуем.
+ * @param {{text: string, tone?: string}} props - текст и тон.
+ * @returns {object|null} элемент.
+ */
 function Notice(props) {
   if (props.text === null || props.text === undefined || props.text === '') return null
   let cls = 'dshMcpNotice'
@@ -396,6 +469,11 @@ function Notice(props) {
   }, props.text)
 }
 
+/**
+ * Список тулзов сервера: «Доступен» и «Ограничен в DSH».
+ * @param {{server: object}} props - сервер из /api/state.
+ * @returns {object} список.
+ */
 function ToolsList(props) {
   const obtained = obtainedToolsOf(props.server)
   if (obtained.length === 0) {
@@ -412,6 +490,11 @@ function ToolsList(props) {
 
 // Заголовки, которые сервис требует от клиента (например X-Redmine-User-Key): имя приходит из
 // записи сервера в шлюзе, значение вводит человек и уходит только в credential-store плагина.
+/**
+ * Таблица заголовков сервера с состоянием «задан».
+ * @param {{server: object}} props - сервер из /api/state.
+ * @returns {object} таблица.
+ */
 function ServerHeaders(props) {
   const items = headerListOf(props.server)
   const [draft, setDraft] = useState({})
@@ -494,6 +577,11 @@ function ServerHeaders(props) {
 // Личные переменные, которые требует сервер (REDMINE_PERSONAL_KEY и т.п.). Значение пишется
 // прямо в шлюз ключом пользователя (POST /v1/mcp/server/<id>/user-env-vars), в плагине не
 // хранится, на экран больше не возвращается — видно только «задан / не задан».
+/**
+ * Таблица обязательных env-переменных сервера (значения не показываем).
+ * @param {{server: object}} props - сервер из /api/state.
+ * @returns {object} таблица.
+ */
 function ServerEnvVars(props) {
   const items = Array.isArray(props.server.envRequired) ? props.server.envRequired : []
   const [draft, setDraft] = useState({})
@@ -558,6 +646,11 @@ const POLL_DELAY_MS = 2000
 const POLL_MAX = 15
 
 // Состояние ещё меняется само: подключение, переключение токена или ожидание применения.
+/**
+ * Нужен ли повторный опрос /api/state: пока применяется патч или серверы ещё подключаются.
+ * @param {object|null} data - ответ /api/state.
+ * @returns {boolean} продолжать ли опрос.
+ */
 function needsPoll(data) {
   if (data === null || data === undefined) return false
   const phase = String(data.phase || '')
@@ -567,6 +660,10 @@ function needsPoll(data) {
   return servers.some((server) => server !== null && server !== undefined && server.status === 'starting')
 }
 
+/**
+ * Состояние экрана: /api/state и опрос, пока applyState не станет готовым (needsPoll).
+ * @returns {{status: string, data: object|null, error: string}} снимок состояния.
+ */
 function useMcpState() {
   const [state, setState] = useState({ status: 'loading', data: null, error: '' })
   const [notice, setNotice] = useState(null)
@@ -662,6 +759,11 @@ function useMcpState() {
 }
 
 
+/**
+ * Диалог ввода/замены ключа токена (значение уходит только на хост).
+ * @param {object} props - токен, серверы и обработчики.
+ * @returns {object} диалог.
+ */
 function ConnectKeyDialog(props) {
   const [key, setKey] = useState('')
   const [label, setLabel] = useState('')
@@ -771,6 +873,11 @@ function ConnectKeyDialog(props) {
     error === '' ? null : h(Notice, { text: error, tone: 'bad' })))
 }
 
+/**
+ * Диалог отключения от серверов токена.
+ * @param {object} props - токен и обработчики.
+ * @returns {object} диалог.
+ */
 function DisconnectDialog(props) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -802,6 +909,11 @@ function DisconnectDialog(props) {
     error === '' ? null : h(Notice, { text: error, tone: 'bad' })))
 }
 
+/**
+ * Диалог удаления токена.
+ * @param {object} props - токен и обработчики.
+ * @returns {object} диалог.
+ */
 function RemoveTokenDialog(props) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -842,6 +954,11 @@ function RemoveTokenDialog(props) {
     error === '' ? null : h(Notice, { text: error, tone: 'bad' })))
 }
 
+/**
+ * Диалог SSO-входа провайдера: где взять токен и как его вставить.
+ * @param {object} props - данные SSO и обработчики.
+ * @returns {object} диалог.
+ */
 function SsoDialog(props) {
   return h(Modal, {
     open: true,
@@ -889,23 +1006,26 @@ function spendTone(spend, maxBudget) {
 }
 
 /**
- * Загрузчик денег: тянет /api/budget отдельно от /api/state, чтобы статистика не держала
- * остальной экран. Пока ответа нет — status 'loading'; ошибка сети — status 'error' (данные,
- * если они уже были, сохраняются).
- * @param {{initial?: object|null, live?: boolean}} options - кеш из состояния и режим опроса.
- * @returns {{data: object|null, status: string}} данные и состояние загрузки.
+ * Общий «фид» с сервера: GET сразу и далее раз в intervalMs, пока вкладка видима. Один код на все
+ * карточки: раньше опрос был скопирован в useBudgetFeed и useUpdateFeed, поэтому паузу на скрытой
+ * вкладке, отмену при размонтировании и статус ошибки приходилось править дважды.
+ * @param {{path: string, initial?: object|null, live?: boolean, intervalMs?: number}} options -
+ *   адрес, кеш из состояния, режим опроса и период (по умолчанию минута).
+ * @returns {{data: object|null, status: string}} данные и статус: 'loading' | 'ready' | 'error'.
  */
-function useBudgetFeed(options) {
+function useLiveFeed(options) {
   const settings = options !== null && options !== undefined ? options : {}
+  const path = String(settings.path || '')
   const initial = settings.initial !== null && settings.initial !== undefined ? settings.initial : null
   const live = settings.live === true
+  const intervalMs = Number(settings.intervalMs) > 0 ? Number(settings.intervalMs) : 60000
   const [data, setData] = useState(initial)
   const [status, setStatus] = useState(initial === null ? 'loading' : 'ready')
   useEffect(() => {
     let disposed = false
     let timer
     const load = () => {
-      callApi('GET', '/budget').then((payload) => {
+      callApi('GET', path).then((payload) => {
         if (disposed) return
         setData(payload)
         setStatus('ready')
@@ -913,14 +1033,13 @@ function useBudgetFeed(options) {
         if (!disposed) setStatus('error')
       })
     }
-    // Расход во шлюзе флашится раз в ~10 с, а лимит меняется ещё медленнее: минуты хватает.
     const schedule = () => {
       window.clearTimeout(timer)
       if (disposed) return
       timer = window.setTimeout(() => {
         if (!document.hidden) load()
         schedule()
-      }, 60000)
+      }, intervalMs)
     }
     load()
     if (live) schedule()
@@ -928,8 +1047,20 @@ function useBudgetFeed(options) {
       disposed = true
       window.clearTimeout(timer)
     }
-  }, [live])
+  }, [path, live, intervalMs])
   return { data, status }
+}
+
+/**
+ * Деньги активного ключа: расход и лимиты из /key/info и /user/info шлюза. Тянем отдельно от
+ * /api/state, чтобы статистика не держала остальной экран; опрос раз в минуту — расход во шлюзе
+ * флашится раз в ~10 с, а лимит меняется ещё медленнее.
+ * @param {{initial?: object|null, live?: boolean}} options - кеш из состояния и режим опроса.
+ * @returns {{data: object|null, status: string}} данные и состояние загрузки.
+ */
+function useBudgetFeed(options) {
+  const settings = options !== null && options !== undefined ? options : {}
+  return useLiveFeed({ path: '/budget', initial: settings.initial, live: settings.live, intervalMs: 60000 })
 }
 
 /**
@@ -964,7 +1095,7 @@ function BudgetCard(props) {
     return h('div', { className: 'dshMcpCard' },
       h('div', { className: 'dshMcpCardHead' },
         h('div', null,
-          h('h3', { className: 'dshMcpCardTitle' }, 'Бюджет ключа'),
+          h('h3', { className: 'dshMcpCardTitle' }, 'Деньги: сколько осталось'),
           h('p', { className: 'dshMcpCardNote' }, 'Сколько денег осталось у ключа в шлюзе LiteLLM.'))),
       h(Notice, { text: error === '' ? 'Шлюз не рассказал о расходе ключа.' : 'Шлюз не отвечает: ' + error, tone: 'warn' }))
   }
@@ -1114,7 +1245,7 @@ function BudgetChip() {
   const tip = open
     ? h('span', { className: 'dshBudgetTip', role: 'tooltip' },
       h('span', { className: 'dshBudgetTipHead' }, limit === null
-        ? 'Бюджет аккаунта: лимита нет'
+        ? 'Деньги аккаунта: лимита нет'
         : 'Осталось ' + moneyOf(left) + ' из ' + moneyOf(limit)),
       h('span', { className: 'dshBudgetTipRow' },
         h('span', null, 'Израсходовано' + (user !== null && user.budgetDuration !== '' ? ' за ' + user.budgetDuration : '')),
@@ -1153,43 +1284,17 @@ function BudgetChip() {
 
 
 /**
- * Загрузчик проверки обновлений: /api/update отдельным запросом — это единственный поход плагина
- * в интернет (GitHub), и настройки не должны его ждать. Сервер кеширует ответ на updateCheckMs.
+ * Проверка обновлений: /api/update отдельным запросом — это единственный поход плагина в интернет
+ * (GitHub), и настройки не должны его ждать. Сервер кеширует ответ на updateCheckMs, поэтому опрос
+ * раз в шесть часов осмысленен; ошибки не показываем — молчание GitHub не повод ломать чип
+ * (подробности в карточке настроек).
  * @param {{initial?: object|null, live?: boolean}} options - кеш из состояния и режим опроса.
  * @returns {object|null} блок update либо null, пока не ответили.
  */
 function useUpdateFeed(options) {
   const settings = options !== null && options !== undefined ? options : {}
-  const initial = settings.initial !== null && settings.initial !== undefined ? settings.initial : null
-  const live = settings.live === true
-  const [data, setData] = useState(initial)
-  useEffect(() => {
-    let disposed = false
-    let timer
-    const load = () => {
-      callApi('GET', '/update').then((payload) => {
-        if (!disposed) setData(payload)
-      }).catch(() => {
-        /* молчание GitHub — не повод ломать чип: подробности в карточке настроек */
-      })
-    }
-    // Суточный кеш на хосте: чаще спрашивать бессмысленно, шести часов хватает.
-    const schedule = () => {
-      window.clearTimeout(timer)
-      if (disposed) return
-      timer = window.setTimeout(() => {
-        if (!document.hidden) load()
-        schedule()
-      }, 6 * 60 * 60 * 1000)
-    }
-    load()
-    if (live) schedule()
-    return () => {
-      disposed = true
-      window.clearTimeout(timer)
-    }
-  }, [live])
-  return data
+  const feed = useLiveFeed({ path: '/update', initial: settings.initial, live: settings.live, intervalMs: 6 * 60 * 60 * 1000 })
+  return feed.data
 }
 
 /**
@@ -1385,6 +1490,11 @@ function UpdateCard() {
       '; ответ кешируется на сутки (updateCheckMs), сеть можно выключить (updateCheck: false).'))
 }
 
+/**
+ * Вкладка «Доступ»: модели токена, ключ токена, тулзы по серверам.
+ * @param {{data: object}} props - снимок /api/state.
+ * @returns {object} содержимое вкладки.
+ */
 function AccessTab(props) {
   const data = props.data
   const tokens = Array.isArray(data.tokens) ? data.tokens : []
@@ -1485,6 +1595,11 @@ function AccessTab(props) {
       : null)
 }
 
+/**
+ * Вкладка «Серверы»: MCP-серверы токена, их состояние и требования.
+ * @param {{data: object}} props - снимок /api/state.
+ * @returns {object} содержимое вкладки.
+ */
 function ServersTab(props) {
   const data = props.data
   const tokens = Array.isArray(data.tokens) ? data.tokens : []
@@ -1718,6 +1833,11 @@ function ServersTab(props) {
       : h('p', { className: 'dshMcpFoot' }, 'в конфиге, но не выданы ключу: ' + configOnly.join(', ')))
 }
 
+/**
+ * Вкладка «Ещё»: деньги ключа, обновления, диагностика.
+ * @param {{data: object}} props - снимок /api/state.
+ * @returns {object} содержимое вкладки.
+ */
 function ExtraTab(props) {
   const data = props.data
   const tokens = Array.isArray(data.tokens) ? data.tokens : []
@@ -1937,6 +2057,10 @@ function PromptsTab(props) {
           h(Button, { variant: 'outline', disabled: busy === item.id, onClick: () => copy(item) }, 'Копировать'))))))
 }
 
+/**
+ * Корневая панель экрана настроек: вкладки, диалоги и чипы под композером.
+ * @returns {object} экран.
+ */
 function MCPAccessPanel() {
   const store = useMcpState()
   const [tab, setTab] = useState('access')
@@ -2114,6 +2238,11 @@ function sendPromptToSession(text) {
   return Promise.reject(new Error('клиент не умеет отправлять в сессию'))
 }
 
+/**
+ * Точка входа клиентского плагина: регистрирует экран в слоте settings.section и чипы в доке композера.
+ * @param {object} ctx - контекст клиентского плагина.
+ * @returns {void}
+ */
 function apply(ctx) {
   pluginCtx = ctx
   ctx.effect(() => {
@@ -2150,3 +2279,4 @@ function apply(ctx) {
 exports.NS = NS
 exports.inject = inject
 exports.apply = apply
+

@@ -104,8 +104,8 @@ process.stdout.write('пуш в ' + GITLAB_REMOTE + ':' + GITLAB_BRANCH + '\n')
 if (options.mirror) {
   if (!existsSync(join(MIRROR_DIR, '.git'))) throw new Error('нет клона публикации: ' + MIRROR_DIR
     + ' (git clone git@github.com:irtokarkkeja/dsh-verme-gate-plugin.git ' + MIRROR_DIR + ')')
-  const files = ['index.js', 'cordis.patch.yml', 'package.json', 'README.md', 'page.html', 'selftest.mjs', 'lib', 'client', 'prompts', 'scripts']
-  const dirs = ['lib', 'client', 'prompts', 'scripts']
+  const files = ['index.js', 'cordis.patch.yml', 'package.json', 'README.md', 'page.html', 'selftest.mjs', 'lib', 'client', 'prompts', 'scripts', 'test']
+  const dirs = ['lib', 'client', 'prompts', 'scripts', 'test']
   // Урок 0.3.21–0.3.24: `cp -a src/lib mirror/lib` при существующем mirror/lib кладёт каталог
   // ВНУТРЬ (mirror/lib/lib), а верхний mirror/lib/client.js остаётся от прошлой версии — так
   // четыре релиза уехали в зеркало со старым клиентским бандлом (шапка «verme-gate 0.3.20»).

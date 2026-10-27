@@ -59,8 +59,9 @@ import { readFile, readdir, mkdir, writeFile, rename, stat, appendFile, chmod } 
 import { existsSync, readFileSync } from 'node:fs'
 import { join, dirname, basename } from 'node:path'
 import { homedir } from 'node:os'
+import { applyRefWithLock } from './lib/credentials-emergency.js'
 
-const LOG_PREFIX = '[dsh-mcp-access]'
+const LOG_PREFIX = '[verme-gate]'
 /** POSIX-identifier credential-ref (копия REF_PATTERN, PKG/dsh-credentials/lib/index.js:13). */
 const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 /** Пространство имён credential-ref'ов плагина: чужие ref'ы писать запрещено (ревью P1-2/F2). */
@@ -112,7 +113,7 @@ function hostResolve(spec) {
       failures.push(String(error && error.message ? error.message : error))
     }
   }
-  throw new Error('dsh-mcp-access: cannot resolve host package "' + spec + '" (tried ' + bases.length + ' bases): ' + (failures[0] || ''))
+  throw new Error('verme-gate: cannot resolve host package "' + spec + '" (tried ' + bases.length + ' bases): ' + (failures[0] || ''))
 }
 
 /**
@@ -242,7 +243,7 @@ async function hostImport(spec) {
   try {
     entry = hostResolve(spec)
   } catch (error) {
-    throw new Error('dsh-mcp-access: пакет хоста "' + spec + '" не найден в сборке DSH'
+    throw new Error('verme-gate: пакет хоста "' + spec + '" не найден в сборке DSH'
       + (dshRuntime.version === '' ? ' (версия DSH неизвестна)' : ' ' + dshRuntime.version)
       + '; плагин собран под DSH ' + DSH_TESTED_RANGE + '. Подробности: '
       + String(error && error.message ? error.message : error))
@@ -307,7 +308,7 @@ function hostModuleUrl(spec, subpath = '') {
     if (target === '') continue
     return pathToFileURL(join(packageDir, target)).href
   }
-  throw new Error('dsh-mcp-access: cannot locate ESM package "' + spec + (subpath === '' ? '' : '/' + subpath) + '" in host node_modules')
+  throw new Error('verme-gate: cannot locate ESM package "' + spec + (subpath === '' ? '' : '/' + subpath) + '" in host node_modules')
 }
 
 /** Диапазон DSH, на котором плагин проверен: ровно линия 0.2.1 (не 0.2.2-alpha — там не проверяли). */
@@ -1152,7 +1153,11 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
    * Аварийная запись/удаление ref'а напрямую в файл credential-store (R2-b).
    * Нужна на штатной остановке: сервис credentials-local к этому моменту уже закрыт
    * («credentials-local is disposed: cannot set …»), а durable-снимок обязан вернуться в ref.
-   * Пишем атомарно (tmp + rename, режим 600) и подтверждаем результат чтением файла.
+   *
+   * Блокировка — та же, что у штатного store: withFileLock держит файл '<store>.lock', поэтому наш
+   * read-modify-write не пересекается с чужими записями (дефект P2: без lock запись store'а,
+   * случившаяся между нашим чтением и rename, терялась). Сам merge живёт в lib/credentials-emergency.js
+   * и покрыт негативными тестами: чужие ref'ы, битый YAML, readback, гонка перечитывания.
    * @param {string} ref - имя ref'а в store.
    * @param {string} value - значение; пустая строка — удалить ref.
    * @returns {Promise<boolean>} true — запись подтверждена чтением.
@@ -1160,22 +1165,31 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
   const emergencyCredentialWrite = async (ref, value) => {
     const file = credentialsFile()
     try {
-      const text = await readFile(file, 'utf8').catch(() => '')
-      const document = text.trim() === '' ? { version: 1 } : YAML.parse(text)
-      if (document === null || typeof document !== 'object') return false
-      const refs = document.refs !== null && typeof document.refs === 'object' && !Array.isArray(document.refs)
-        ? document.refs
-        : {}
-      if (value === '') delete refs[ref]
-      else refs[ref] = value
-      document.refs = refs
-      if (document.version === undefined) document.version = 1
-      const tmp = file + '.tmp-restore-' + randomUUID()
-      await writeFile(tmp, YAML.stringify(document), { mode: 0o600 })
-      await rename(tmp, file)
-      const check = YAML.parse(await readFile(file, 'utf8'))
-      const actual = check && check.refs && typeof check.refs[ref] === 'string' ? check.refs[ref] : ''
-      return actual === (value === '' ? '' : value)
+      // atomic-write есть в поставке DSH; если в этой версии его нет — работаем без блокировки,
+      // но с перечитыванием файла перед записью (защита от гонки внутри applyRefWithLock).
+      const atomic = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-atomic-write')).href)
+        .catch(() => undefined)
+      const withLock = atomic !== undefined && typeof atomic.withFileLock === 'function'
+        ? (operation) => atomic.withFileLock(file, operation)
+        : (operation) => operation()
+      const writeText = atomic !== undefined && typeof atomic.writeFileAtomic === 'function'
+        ? (text) => atomic.writeFileAtomic(file, text, { mode: 0o600 })
+        : async (text) => {
+          const tmp = file + '.tmp-restore-' + randomUUID()
+          await writeFile(tmp, text, { mode: 0o600 })
+          await rename(tmp, file)
+        }
+      const result = await applyRefWithLock({
+        withLock,
+        readText: () => readFile(file, 'utf8').catch(() => ''),
+        writeText,
+        parse: (text) => YAML.parse(text),
+        stringify: (document) => YAML.stringify(document),
+        ref,
+        value,
+      })
+      if (!result.ok) log('warn', 'emergency credential write ref=' + ref + ': ' + result.error)
+      return result.ok
     } catch (error) {
       log('warn', 'emergency credential write ref=' + ref + ': ' + messageOf(error))
       return false

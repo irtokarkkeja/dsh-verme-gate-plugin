@@ -455,6 +455,58 @@ check('страница плагина называет себя verme-gate (а 
 check('ключ токена валидируется так же, как в пробе (иначе мусор = «ключ задан» + degraded)',
   (source.match(/не похоже на ключ LiteLLM/g) || []).length >= 2)
 
+// --- негативные инварианты: как система обязана вести себя при плохих входах ------------------
+
+const clientSource = await readFile(new URL('client/index.cjs', here), 'utf8')
+check('журнал и коды ошибок носят новое имя verme-gate (старое путает при разборе логов)',
+  source.includes("const LOG_PREFIX = '[verme-gate]'")
+  && source.includes("throw new Error('verme-gate: cannot resolve host package")
+  && !source.includes("'dsh-mcp-access: "))
+check('аварийная запись credential-store идёт под блокировкой штатного store',
+  source.includes("hostResolve('@deepseek-ai/dsh-atomic-write')")
+  && source.includes('withFileLock(file, operation)')
+  && source.includes('writeFileAtomic(file, text, { mode: 0o600 })')
+  && source.includes("from './lib/credentials-emergency.js'"))
+check('аварийная запись: битый YAML не перезаписывается, успех — только после readback (тесты модуля)',
+  (await readFile(new URL('lib/credentials-emergency.js', here), 'utf8')).includes('credential-store не разбирается')
+  && (await readFile(new URL('lib/credentials-emergency.js', here), 'utf8')).includes('readback mismatch'))
+check('опрос сервера живёт в одном месте: карточки не копируют таймер и статус ошибки',
+  (clientSource.match(/function useLiveFeed\(/g) || []).length === 1
+  && (clientSource.match(/window\.setTimeout\(\(\) => \{/g) || []).length === 1
+  && clientSource.includes("useLiveFeed({ path: '/budget'")
+  && clientSource.includes("useLiveFeed({ path: '/update'"))
+check('деньги называются одинаково во всех ветках карточки и в подсказке чипа',
+  !clientSource.includes('Бюджет ключа')
+  && !clientSource.includes('Бюджет аккаунта')
+  && (clientSource.match(/Деньги: сколько осталось/g) || []).length >= 3)
+const undocumented = clientSource.split('\n').filter((line, index, all) => {
+  if (!/^function [A-Za-z0-9_]+\(/.test(line)) return false
+  let cursor = index - 1
+  while (cursor >= 0 && all[cursor].trim() === '') cursor -= 1
+  return cursor < 0 || !all[cursor].trim().endsWith('*/')
+})
+check('у каждой клиентской функции есть JSDoc (иначе новый человек читает экран с нуля)',
+  undocumented.length === 0,
+  undocumented.length === 0 ? undefined : 'без описания: ' + undocumented.map((line) => line.replace(/^function /, '').replace(/\(.*/, '')).join(', '))
+
+// Юнит-тесты аварийной записи: гонка писателей, битый файл, потеря чужих ref'ов.
+const { execFileSync } = await import('node:child_process')
+let unitTestsOk = true
+let unitTestsDetail = ''
+try {
+  const testFiles = [
+    new URL('test/credentials-emergency.test.mjs', here).pathname,
+    new URL('test/credentials-race.test.mjs', here).pathname,
+  ]
+  const output = execFileSync(process.execPath, ['--test', ...testFiles], { encoding: 'utf8' })
+  unitTestsOk = /# fail 0|fail 0/.test(output)
+  unitTestsDetail = output.split('\n').filter((line) => line.startsWith('# fail') || line.startsWith('# pass')).join(' ')
+} catch (error) {
+  unitTestsOk = false
+  unitTestsDetail = String(error && error.stdout ? error.stdout : error).split('\n').slice(-6).join(' ')
+}
+check('негативные тесты аварийной записи credential-store проходят', unitTestsOk, unitTestsDetail)
+
 console.log('')
 console.log(failures === 0 ? 'selftest: PASS' : 'selftest: FAIL (' + failures + ')')
 process.exitCode = failures === 0 ? 0 : 1

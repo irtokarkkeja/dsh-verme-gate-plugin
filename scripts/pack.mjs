@@ -1,9 +1,9 @@
 /**
  * pack.mjs — собрать дистрибутив verme-gate для установки без доступа к GitHub.
  *
- * Что пакуется: только рантайм плагина — index.js, lib/, client/, prompts/, page.html,
- * cordis.patch.yml, README.md, selftest.mjs и package.json. Набор = package.json "files"
- * МИНУС dev-каталоги (scripts/, test/, docs/): они нужны только для разработки и релиза.
+ * Что пакуется: рантайм плагина — index.js, lib/, client/, prompts/, page.html,
+ * cordis.patch.yml, README.md, package.json — и релизный гейт: selftest.mjs, scripts/ и test/.
+ * Набор = package.json "files" МИНУС dev-каталоги (docs/).
  *
  * Почему prompts/page.html/cordis.patch.yml — рантайм, хотя в задаче названы лишь index.js/lib/client:
  *   - prompts/   — плагин читает каталог встроенных промптов (index.js: BUNDLED_PROMPTS_DIR = ./prompts/);
@@ -24,7 +24,7 @@
  * клиентским бандлом: 110 939 вместо 126 702 байт). Проверка версии и размеров — ниже.
  */
 import { execFileSync } from 'node:child_process'
-import { cp, mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -37,16 +37,16 @@ const PLUGIN_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
 const REQUIRED = ['index.js', 'lib', 'client', 'prompts', 'page.html', 'cordis.patch.yml', 'README.md', 'package.json']
 
 /**
- * scripts/ и selftest.mjs — не «рантайм плагина», а релизный гейт: приёмка по инструкции
- * распаковывает тарбол и гоняет `node selftest.mjs`, который читает scripts/release.mjs и
- * scripts/build-client.mjs. Без них гейт падает на распакованном артефакте (проверено),
- * а в зеркале GitHub каталог scripts есть — значит и тарбол обязан его содержать,
- * иначе два пути установки не эквивалентны.
+ * scripts/, test/ и selftest.mjs — не «рантайм плагина», а релизный гейт: приёмка по инструкции
+ * распаковывает тарбол и гоняет `node selftest.mjs`, который читает scripts/release.mjs,
+ * scripts/build-client.mjs и прогоняет негативные тесты аварийной записи credential-store из test/.
+ * Без них гейт падает на распакованном артефакте (проверено), а в зеркале GitHub эти каталоги
+ * есть — значит и тарбол обязан их содержать, иначе два пути установки не эквивалентны.
  */
-const REQUIRED_EXTRA = ['selftest.mjs', 'scripts']
+const REQUIRED_EXTRA = ['selftest.mjs', 'scripts', 'test']
 
 /** Никогда не пакуем: артефакты разработки и лабы. */
-const EXCLUDE = ['test', 'docs', 'node_modules', 'dist', '.git', '.plugin-manager']
+const EXCLUDE = ['docs', 'node_modules', 'dist', '.git', '.plugin-manager']
 
 /**
  * Вложенные пути, которые вырезаем даже из scripts/: в раздаче их быть не должно.
@@ -91,14 +91,24 @@ function hasRef(repoDir, ref) {
   }
 }
 
-/** Источник времени для воспроизводимого архива: время последнего коммита или SOURCE_DATE_EPOCH. */
-function buildEpoch() {
+/**
+ * Источник времени для воспроизводимого архива: SOURCE_DATE_EPOCH, иначе время коммита.
+ * Для --from-tag берём время коммита ТЕГА: иначе mtime зависит от текущего HEAD репозитория и
+ * две сборки одного тега дают разные sha (так разошлись сборки 0.3.27 у меня и у Lead).
+ */
+function buildEpoch(ref) {
   if (process.env.SOURCE_DATE_EPOCH) return Number(process.env.SOURCE_DATE_EPOCH)
-  try {
-    return Number(run('git', ['log', '-1', '--format=%ct'], PLUGIN_DIR))
-  } catch {
-    return Math.floor(Date.now() / 1000)
+  const mirror = process.env.VERME_GATE_MIRROR_DIR || '/tmp/dsh-verme-gate-plugin'
+  const candidates = ref ? [PLUGIN_DIR, mirror] : [PLUGIN_DIR]
+  for (const dir of candidates) {
+    try {
+      if (ref && !hasRef(dir, ref)) continue
+      return Number(run('git', ['log', '-1', '--format=%ct', ref || 'HEAD'], dir))
+    } catch {
+      // пробуем следующий репозиторий
+    }
   }
+  return Math.floor(Date.now() / 1000)
 }
 
 /** sha256 файла. */
@@ -179,7 +189,7 @@ try {
   // Права нормализуем: рабочие файлы бывают 0600, у git-тега — 0644; иначе одинаковое содержимое
   // даёт разные байты архива и «несовпадающий sha256» на пустом месте.
   run('chmod', ['-R', 'u+rwX,go+rX,go-w', root], staging)
-  const epoch = buildEpoch()
+  const epoch = buildEpoch(options.fromTag)
   const tarballName = name + '-' + version + (options.fromTag === '' ? '' : '-tag') + '.tgz'
   const outDir = options.out
   await mkdir(outDir, { recursive: true })
@@ -205,6 +215,18 @@ try {
   process.stdout.write('  размер:  ' + human(info.size) + ' (' + info.size + ' байт)\n')
   process.stdout.write('  sha256:  ' + (await sha256(tarball)) + '\n')
   process.stdout.write('  файлов:  ' + listing.filter((line) => !line.endsWith('/')).length + '\n')
+  process.stdout.write('  mtime:   @' + epoch + ' (для воспроизводимости: SOURCE_DATE_EPOCH=' + epoch + ')\n')
+  // Манифест по файлам: sha256 архива зависит от tar/gzip окружения, поэтому сверять сборки
+  // между машинами надёжнее по содержимому — он и печатается рядом с архивом.
+  const manifest = []
+  for (const entry of listing.filter((line) => !line.endsWith('/'))) {
+    manifest.push((await sha256(join(root, entry.replace(/^package\//, '')))) + '  ' + entry.replace(/^package\//, ''))
+  }
+  manifest.sort()
+  await writeFile(tarball + '.manifest.txt',
+    '# verme-gate ' + version + ' — содержимое архива (сверка между машинами)\n'
+    + '# mtime @' + epoch + ', файлов ' + manifest.length + '\n' + manifest.join('\n') + '\n')
+  process.stdout.write('  манифест: ' + tarball + '.manifest.txt\n')
   process.stdout.write('установка:\n  dsh plugin --profile web add file:' + tarball + '\n')
 } finally {
   await rm(staging, { recursive: true, force: true })
