@@ -116,6 +116,115 @@ function hostResolve(spec) {
 }
 
 /**
+ * Каталог пакета хоста по абсолютному пути его файла входа (подъём до package.json с тем же именем).
+ * @param {string} entryPath - путь к резолвнутому файлу пакета.
+ * @param {string} spec - имя пакета для сверки манифеста.
+ * @returns {string} каталог пакета ('' — не нашли).
+ */
+function hostPackageRoot(entryPath, spec) {
+  let dir = dirname(entryPath)
+  for (let depth = 0; depth < 6; depth += 1) {
+    const manifestPath = join(dir, 'package.json')
+    if (existsSync(manifestPath)) {
+      try {
+        const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+        if (manifest !== null && typeof manifest === 'object' && manifest.name === spec) return dir
+      } catch {
+        /* битый манифест — поднимаемся выше */
+      }
+    }
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return ''
+}
+
+/**
+ * Версия среды DSH, в которой работает плагин. Плагин грузится и как профильный бандл, и как
+ * строка патча с абсолютным путём — во втором случае гейт совместимости DSH (dsh.bundle/engines.dsh)
+ * не применяется вовсе, поэтому версию читаем сами.
+ * @returns {{version: string, dir: string}} версия ('' — неизвестна) и каталог установки DSH.
+ */
+function detectDshRuntime() {
+  /** Прочитать версию из манифеста каталога DSH; '' — не получилось. */
+  const versionOf = (dir) => {
+    if (dir === '') return { version: '', dir: '' }
+    try {
+      const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+      return { version: typeof manifest.version === 'string' ? manifest.version : '', dir }
+    } catch {
+      return { version: '', dir: '' }
+    }
+  }
+  // 1. Обычный путь: пакет dsh резолвится как модуль.
+  try {
+    const direct = versionOf(hostPackageRoot(hostResolve('@deepseek-ai/dsh'), '@deepseek-ai/dsh'))
+    if (direct.version !== '') return direct
+  } catch {
+    /* exports-карта dsh может не отдавать '.' — идём соседом */
+  }
+  // 2. Сосед по node_modules: любой резолвнутый @deepseek-ai/dsh-* лежит рядом с dsh.
+  try {
+    const sibling = hostResolve('@deepseek-ai/dsh-mcp-client')
+    const marker = '/node_modules/@deepseek-ai/'
+    const at = sibling.lastIndexOf(marker)
+    if (at !== -1) {
+      const found = versionOf(join(sibling.slice(0, at), 'node_modules', '@deepseek-ai', 'dsh'))
+      if (found.version !== '') return found
+    }
+  } catch {
+    /* нет и соседа — остаются корни установки */
+  }
+  // 3. Корни установки: тот же список, что у hostResolve.
+  const roots = [process.env.DSH_PACKAGE_ROOT, '/home/seva/dsh-prod021-pkg', join(homedir(), 'dsh-prod021-pkg')]
+  for (const root of roots) {
+    if (typeof root !== 'string' || root === '') continue
+    const found = versionOf(join(root, 'node_modules', '@deepseek-ai', 'dsh'))
+    if (found.version !== '') return found
+  }
+  return { version: '', dir: '' }
+}
+
+/**
+ * Совместимость с текущей DSH по объявленному диапазону (как engines.dsh у бандла).
+ * semver берём из установки хоста; нет его — считаем «неизвестно» и не пугаем ложной ошибкой.
+ * @param {string} version - версия работающей DSH.
+ * @param {string} range - проверяемый диапазон.
+ * @returns {{known: boolean, ok: boolean, version: string, range: string}} вердикт.
+ */
+function checkDshCompat(version, range) {
+  if (version === '') return { known: false, ok: true, version: '', range }
+  try {
+    const semver = createRequire(join(dshRuntime.dir || process.cwd(), 'package.json'))('semver')
+    // Как гейт DSH 0.2.1: без includePrerelease — иначе 0.2.2-alpha.2 прошёл бы по ^0.2.1-rc.2,
+    // хотя на нём плагин не проверяли.
+    return { known: true, ok: semver.satisfies(version, range), version, range }
+  } catch {
+    return { known: false, ok: true, version, range }
+  }
+}
+
+/**
+ * Импорт пакета хоста с ошибкой, по которой видно причину: «несовместимая сборка DSH», а не
+ * «Cannot find module» из середины apply(). Иначе на другой версии/хосте плагин падает непонятно.
+ * @param {string} spec - имя пакета хоста.
+ * @returns {Promise<object>} пространство имён модуля.
+ */
+async function hostImport(spec) {
+  let entry
+  try {
+    entry = hostResolve(spec)
+  } catch (error) {
+    throw new Error('dsh-mcp-access: пакет хоста "' + spec + '" не найден в сборке DSH'
+      + (dshRuntime.version === '' ? ' (версия DSH неизвестна)' : ' ' + dshRuntime.version)
+      + '; плагин собран под DSH ' + DSH_TESTED_RANGE + '. Подробности: '
+      + String(error && error.message ? error.message : error))
+  }
+  return import(pathToFileURL(entry).href)
+}
+
+/**
  * Каталоги node_modules хоста, где искать пакет вручную: createRequire().resolve не умеет
  * ESM-only пакеты без условия "require" (например @earendil-works/pi-ai: exports "." объявлен
  * только как import), а драйверу маршрута нужен именно он.
@@ -175,10 +284,15 @@ function hostModuleUrl(spec, subpath = '') {
   throw new Error('dsh-mcp-access: cannot locate ESM package "' + spec + (subpath === '' ? '' : '/' + subpath) + '" in host node_modules')
 }
 
+/** Диапазон DSH, на котором плагин проверен: ровно линия 0.2.1 (не 0.2.2-alpha — там не проверяли). */
+const DSH_TESTED_RANGE = '^0.2.1-rc.2'
+/** Версия и каталог работающей DSH: нужны для честного вердикта совместимости и ошибок импорта. */
+const dshRuntime = detectDshRuntime()
+
 const z = (await import(pathToFileURL(hostResolve('@deepseek-ai/schemastery')).href)).default
-const McpClient = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-mcp-client')).href)
-const { credentialRef } = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-credentials')).href)
-const { scopeOf } = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-scope')).href)
+const McpClient = await hostImport('@deepseek-ai/dsh-mcp-client')
+const { credentialRef } = await hostImport('@deepseek-ai/dsh-credentials')
+const { scopeOf } = await hostImport('@deepseek-ai/dsh-scope')
 // yaml нужен аварийному пути восстановления ref'а в обход закрытого сервиса credentials (R2-b).
 const YAML = await import(pathToFileURL(hostResolve('yaml')).href)
 // Свой llm-маршрут: провайдер с ДИНАМИЧЕСКИМ каталогом моделей. Стриминг/ретраи/картинки берёт
@@ -606,6 +720,41 @@ export function apply(ctx, config) {
     // verifyTool разрешён в любом режиме: header-режим проверяется личным токеном, client-headers —
     // сохранёнными заголовками, gateway — вызовом через шлюз (значение лежит у него в user env vars).
   }
+  // Совместимость с текущей DSH: у профильного бандла её сторожит гейт dsh (engines.dsh/peerDependencies),
+  // а у строки патча с абсолютным путём гейта нет вовсе — там вердикт наш. Не бросаем: несовместимая
+  // сборка должна оставить инстанс живым и объяснить себя в логах, /api/state и /api/diag.
+  const dshCompat = checkDshCompat(dshRuntime.version, DSH_TESTED_RANGE)
+  if (!dshCompat.ok) {
+    configErrors.push('плагин не проверялся на DSH ' + dshCompat.version + ' (проверен на ' + DSH_TESTED_RANGE
+      + '): возможны падения; обновите плагин или поставьте DSH из проверенной линии')
+  } else if (!dshCompat.known) {
+    configWarnings.push('версию DSH определить не удалось — совместимость не проверена')
+  }
+  /** Возможности ctx, без которых половина плагина бессмысленна: проверяем до первого монтирования. */
+  const requiredCapabilities = [
+    ['tools.restrict', () => typeof (ctx.tools && ctx.tools.restrict) === 'function'],
+    ['credentials.set', () => typeof (ctx.credentials && ctx.credentials.set) === 'function'],
+    ['credentials.unset', () => typeof (ctx.credentials && ctx.credentials.unset) === 'function'],
+    ['connection.requestRejection', () => typeof (ctx.connection && ctx.connection.requestRejection) === 'function'],
+    ['llm.registerAdapter', () => typeof (ctx.llm && ctx.llm.registerAdapter) === 'function'],
+    ['on', () => typeof ctx.on === 'function'],
+    ['effect', () => typeof ctx.effect === 'function'],
+    ['plugin', () => typeof ctx.plugin === 'function'],
+  ]
+  const missingCapabilities = requiredCapabilities
+    .filter((entry) => {
+      try {
+        return !entry[1]()
+      } catch {
+        return true
+      }
+    })
+    .map((entry) => entry[0])
+  if (missingCapabilities.length > 0) {
+    configErrors.push('в этой сборке DSH нет: ' + missingCapabilities.join(', ')
+      + ' — гейт тулзов и/или монтирование работать не будут')
+  }
+
   const modelSyncEnabled = cfg.modelSync === true && String(cfg.llmProvider || '') !== ''
     && isOwnRef(String(cfg.llmSecretRef || '')) && String(cfg.llmBaseUrl || '') !== ''
   const routesEnabled = pagePath !== '' && stateFile !== ''
@@ -3785,6 +3934,11 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       }),
       generation: state.generation,
       page: pagePath,
+      /**
+       * Сборка DSH, в которой работает плагин, и вердикт совместимости: у строки патча с абсолютным
+       * путём гейт engines.dsh не применяется, поэтому правду об этом знает только сам плагин.
+       */
+      dsh: dshCompat,
       phase: state.phase,
       barrier: state.barrier,
       applyPending: state.applyPending,

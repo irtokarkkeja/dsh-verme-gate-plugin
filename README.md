@@ -386,6 +386,74 @@ Lifetime-`spend` ключа (`$90`) лимитом не является и жи
 3. прежнее значение своего ref снимается снимком при старте и восстанавливается байт-в-байт на dispose
    (вместе со снятием MCP-монтирований).
 
+## Совместимость с DSH и обновление плагина
+
+### Что есть в самом DSH (проверено по 0.2.1-rc.2)
+
+| Механизм | Где | Что даёт | Автообновления? |
+|---|---|---|---|
+| `dsh plugin --profile <p> <pnpm-args>` | `dsh/lib/bin.js` + `dsh/lib/plugin-*.js` | форвард в pnpm внутри каталога профиля: `add`, `remove`, `update`, `why` | нет, команда ручная |
+| `reconcileProfilePlugins` | `dsh-app-boot/lib/index.js:1195-1224` | новый пакет с `dsh.bundle` **сам** попадает в `dsh.profile.bundles`, удалённый — выпадает | — |
+| `ctx.pluginManager.installBundle/removeBundle/inspect/listBundles` | `dsh-plugin-manager/lib/index.js:1970` | программная установка (Settings→Plugins, `plugin_market`) | обновление = `remove`+`install`: при живом HMR `installBundle` отказывает `already-installed` (`:1991`) |
+| Плагин-маркет | `dsh-plugin-market/lib/index.js:628-658` | статус `installed / update-available / different-version` для установленных бандлов + гейт совместимости по версиям | показывает «есть обновление», ставит по клику; фоном не обновляет |
+| Гейт совместимости | `dsh-app-boot/lib/index.js:311-346` (0.2.1-rc.2), `:286-330` (0.2.0/0.1.7) | плагин объявляет `engines.dsh` (0.2.1: решает единолично) или `peerDependencies` на `@deepseek-ai/dsh*` (0.2.0/0.1.7); несовместимый бандл **пропускается** с причиной | — |
+| Исключение из гейта | `compatibility.json` профиля + `dsh plugin allow-version <pkg@ver> --dsh-version <exact> --accept-risk` | точечное разрешение «запустить несовместимое» | — |
+
+Автоматического обновления плагинов в DSH нет: ни таймера, ни проверки при бутe. Единственный
+прецедент «проверки версий» — `dsh-codex-connect`: клиентская половина раз в сутки дёргает
+`registry.npmjs.org/-/package/<name>/dist-tags` и рисует «New version available»; ставит всё равно
+человек. См. `docs/research/codex-plugin-update-polling.md`.
+
+### Как обновляемся мы (одна команда вместо ритуала)
+
+```bash
+node scripts/release.mjs --bump minor -m 'что изменилось'        # версия → сборка клиента → selftest → коммит
+node scripts/release.mjs --bump minor -m 'что изменилось' --yes  # + пуш в gitlab и в зеркало (тег vX)
+```
+
+Обновление в профиле — штатной командой DSH, без правки `cordis.patch.yml` руками:
+
+```bash
+dsh plugin --profile web add github:irtokarkkeja/dsh-verme-gate-plugin#v0.3.19
+systemctl --user restart <unit>   # host-половина перезагружается только рестартом
+```
+
+`add` (а не ручной insert с абсолютным путём) ещё и включает гейт совместимости DSH: несовместимый
+по `engines.dsh` бандл будет пропущен с внятной причиной, а не упадёт в середине `apply()`.
+Установка абсолютным путём в патч остаётся как аварийный путь — тогда совместимость сторожит
+сам плагин (см. ниже).
+
+### Версия DSH: что объявлено и что проверяется
+
+`package.json`: `engines.dsh: "^0.2.1-rc.2"` (решает в 0.2.1) + `peerDependencies` на
+`@deepseek-ai/dsh` (та же линия; для 0.2.0/0.1.7, которые читают только peers). Диапазон
+намеренно узкий: линия 0.2.1 проверена, `0.2.2-alpha.2` — нет. Гейт DSH 0.2.1 сверяет диапазон
+без `includePrerelease`, поэтому `0.2.2-alpha.2` в `^0.2.1-rc.2` не попадает и такой бандл DSH
+просто пропустит; `0.2.0`/0.1.7 сверяют peers с `includePrerelease` — там ту же роль играет
+объявленный peer (`0.2.0-rc.2` тоже не подходит).
+
+При старте плагин сам читает версию хоста (`detectDshRuntime`) и сверяет с проверенным диапазоном:
+
+- `engines.dsh` не применяется **вообще**, если плагин подключён строкой патча с абсолютным путём —
+  поэтому при несовпадении в журнал, `/api/state.configErrors` и `/api/diag` попадает строка
+  «плагин не проверялся на DSH X (проверен на Y)»; инстанс при этом остаётся живым;
+- отсутствие нужных возможностей ctx (`tools.restrict`, `credentials.set/unset`,
+  `connection.requestRejection`, `llm.registerAdapter`, `on`, `effect`, `plugin`) перечисляется
+  по именам в `configErrors` — вместо `TypeError` из середины `apply()`;
+- `/api/state.dsh` отдаёт `{version, range, known, ok}` — вердикт видно в UI и в curl;
+- отсутствующий пакет хоста (`@deepseek-ai/dsh-mcp-client` и др.) даёт ошибку с версией DSH и
+  проверенным диапазоном (`hostImport`), а не `Cannot find module`.
+
+Проверено вживую: 0.2.1-rc.2 (наш прод и лаба). Были в руках, но плагин там не гоняли:
+0.2.0-rc.2, 0.1.7-rc.1. Есть на npm, не проверялись: 0.2.1-rc.3, 0.2.1-rc.4, 0.2.2-alpha.2.
+
+### Что осталось незакрытым
+
+- Плагин не публикуется в npm-реестр: `github:`-пин даёт версионирование и теги, но не даёт
+  `update-available` в маркете (для него нужен https-индекс маркета + пакет в реестре).
+- Автопроверки версии у нас нет: узнаём об обновлении плагина из git-тегов, а не из UI.
+- Прогон на 0.2.1-rc.4 / 0.2.2-alpha.2 — отдельная задача (второй `DSH_HOME` + отдельный порт).
+
 ## Как закрыты замечания ревью
 
 Исходный разбор: `docs/reviews/dsh-mcp-access-review.md`.

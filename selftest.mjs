@@ -379,6 +379,23 @@ check('снимки: ref провайдера и личные значения �
   && source.includes('await snapshotCredential(token.keyRef, value)')
   && source.includes('await snapshotCredential(ref, JSON.stringify(headers))'))
 
+const manifest = JSON.parse(await readFile(new URL('package.json', here), 'utf8'))
+check('совместимость объявлена: engines.dsh и peer на @deepseek-ai/dsh — одной линией',
+  manifest.engines !== undefined && manifest.engines.dsh === '^0.2.1-rc.2'
+  && manifest.peerDependencies !== undefined && manifest.peerDependencies['@deepseek-ai/dsh'] === '^0.2.1-rc.2')
+check('механика версии: чтение версии DSH, сверка диапазона, гейт гост-пакетов',
+  source.includes('const dshRuntime = detectDshRuntime()')
+  && source.includes('const dshCompat = checkDshCompat(dshRuntime.version, DSH_TESTED_RANGE)')
+  && source.includes('async function hostImport(spec)')
+  && source.includes("'плагин не проверялся на DSH '"))
+check('совместимость видна снаружи: /api/state.dsh и configErrors про отсутствующие возможности',
+  source.includes('dsh: dshCompat,')
+  && source.includes('const missingCapabilities = requiredCapabilities')
+  && source.includes("'в этой сборке DSH нет: '"))
+check('релиз одной командой: scripts/release.mjs есть и знает про зеркало и тег',
+  manifest.scripts.release === 'node scripts/release.mjs'
+  && (await readFile(new URL('scripts/release.mjs', here), 'utf8')).includes("const tag = 'v' + next"))
+
 console.log('')
 console.log(failures === 0 ? 'selftest: PASS' : 'selftest: FAIL (' + failures + ')')
 process.exitCode = failures === 0 ? 0 : 1
