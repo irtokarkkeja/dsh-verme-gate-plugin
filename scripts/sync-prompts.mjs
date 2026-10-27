@@ -11,13 +11,21 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+/**
+ * Что именно встраивается в пакет. Источник (deploy/dsh-bootstrap) держит все инструкции сразу,
+ * а в плагин идут только те, что нужны на экране по умолчанию: лишние пункты в списке «Промпты»
+ * отвлекают — остальные можно подключить своим promptsDir или дописать сюда.
+ */
+const INCLUDED = ['DSH-MCP-CHROME-AGENT.md']
+
 const sourceDir = fileURLToPath(new URL('../../../deploy/dsh-bootstrap/', import.meta.url))
 const targetDir = fileURLToPath(new URL('../prompts/', import.meta.url))
 const checkOnly = process.argv.includes('--check')
 
-const names = existsSync(sourceDir)
+const available = existsSync(sourceDir)
   ? (await readdir(sourceDir)).filter((name) => name.endsWith('.md')).sort()
   : []
+const names = available.filter((name) => INCLUDED.includes(name))
 
 if (names.length === 0) {
   // В опубликованном пакете monorepo-раскладки нет: сверять не с чем, копии уже внутри.
