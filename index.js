@@ -445,6 +445,13 @@ export const Config = z.object({
     maxTokens: z.number(),
   })).default({}),
   /**
+   * Модели, которым объявлять приём картинок, когда шлюз об этом молчит.
+   * LiteLLM отдаёт флаг vision не всегда (у нас /model/info — только у части моделей), а pi-ai без
+   * него отвергает вложение: "model does not support image input" (UNSUPPORTED_CONTENT). Список —
+   * страховка оператора, основной источник всё равно ответ шлюза (supports_vision).
+   */
+  visionModels: z.array(z.string()).default([]),
+  /**
    * Окно, объявляемое модели, про которую шлюз молчит (нет max_input_tokens). Это главная ручка
    * «на каком объёме компактить»: DSH считает порог как min(0.8·окно, окно − вывод − headroom),
    * поэтому 131072 даёт компакт на 65536, а 327680 — ровно на 262144 (0.8·327680).
@@ -2399,10 +2406,15 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         const maxTokens = Number(params.max_output_tokens)
         const hasContext = Number.isFinite(contextWindow) && contextWindow > 0
         const hasOutput = Number.isFinite(maxTokens) && maxTokens > 0
-        if (!hasContext && !hasOutput) continue
+        // Приём картинок: LiteLLM кладёт supports_vision в model_info (иногда в litellm_params).
+        // Без этого флага pi-ai объявляет модель текстовой и валит вложение с UNSUPPORTED_CONTENT.
+        const info = entry.model_info !== null && typeof entry.model_info === 'object' ? entry.model_info : {}
+        const vision = info.supports_vision === true || params.supports_vision === true
+        if (!hasContext && !hasOutput && !vision) continue
         limits.set(modelId, {
           ...(hasContext ? { contextWindow } : {}),
           ...(hasOutput ? { maxTokens } : {}),
+          ...(vision ? { vision: true } : {}),
         })
       }
     } catch {
@@ -2804,6 +2816,11 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       if (typeof override.contextWindow === 'number') merged.contextWindow = override.contextWindow
       if (typeof override.maxTokens === 'number') merged.maxTokens = override.maxTokens
       if (Object.keys(merged).length > 0) modelState.limits.set(modelId, merged)
+    }
+    // Картинки: список оператора — поверх ответа шлюза (шлюз сообщает флаг не для всех моделей).
+    for (const modelId of cfg.visionModels || []) {
+      if (typeof modelId !== 'string' || modelId === '') continue
+      modelState.limits.set(modelId, { ...(modelState.limits.get(modelId) || {}), vision: true })
     }
     // Потолок вывода: объявленный вывод DSH вычитает из окна целиком, поэтому огромный
     // maxTokens из шлюза (opus 64000 при окне 200000) съедает четверть окна до первого хода.
@@ -4373,7 +4390,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     try {
       return await readFile(new URL('./page.html', import.meta.url), 'utf8')
     } catch {
-      return '<!doctype html><meta charset="utf-8"><title>dsh-mcp-access</title>'
+      return '<!doctype html><meta charset="utf-8"><title>verme-gate</title>'
         + '<h1>verme-gate</h1><p>page.html отсутствует; API: ' + pagePath + '/api/state</p>'
     }
   }
@@ -4618,7 +4635,12 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       if (!isOwnRef(token.keyRef)) {
         return json(res, 400, { error: 'token "' + token.id + '": keyRef "' + (token.keyRef || '(пусто)') + '" вне пространства ' + OWN_REF_PREFIX + '* — запись запрещена' })
       }
-      const value = typeof body.value === 'string' ? body.value : ''
+      // Та же проверка, что в probeKey: иначе мусор в поле «ключ» сохраняется как «ключ задан»,
+      // discovery падает, а экран одновременно показывает зелёный ключ и degraded.
+      const value = (typeof body.value === 'string' ? body.value : '').trim()
+      if (value !== '' && (value.length > 200 || /\s/.test(value))) {
+        return json(res, 400, { error: 'это не похоже на ключ LiteLLM: в ключе нет пробелов и переводов строк' })
+      }
       await snapshotCredential(token.keyRef, value)
       if (value === '') {
         await ctx.credentials.unset(credentialRef(token.keyRef))

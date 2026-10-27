@@ -444,6 +444,16 @@ check('бандл-патч не навязывает модель по умол�
   bundlePatchCode.includes('id: verme-gate')
   && !bundlePatchCode.includes('agent-default-model')
   && !bundlePatchCode.includes('deepseek/deepseek-v4-pro'))
+check('картинки: приём объявляется по флагу шлюза supports_vision или списку visionModels',
+  source.includes('supports_vision')
+  && source.includes('visionModels: z.array(z.string()).default([])')
+  && (await readFile(new URL('lib/gateway-route.js', here), 'utf8')).includes("input: entry.vision === true ? ['text', 'image'] : ['text']"))
+check('страница плагина называет себя verme-gate (а не старое dsh-mcp-access)',
+  page.includes('<title>verme-gate')
+  && page.includes('<h1>verme-gate</h1>')
+  && !page.includes('dsh-mcp-access'))
+check('ключ токена валидируется так же, как в пробе (иначе мусор = «ключ задан» + degraded)',
+  (source.match(/не похоже на ключ LiteLLM/g) || []).length >= 2)
 
 console.log('')
 console.log(failures === 0 ? 'selftest: PASS' : 'selftest: FAIL (' + failures + ')')
