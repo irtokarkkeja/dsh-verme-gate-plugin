@@ -353,6 +353,11 @@ export const Config = z.object({
    * состояние часто, а расход меняется медленно. 0 — спрашивать шлюз каждый раз.
    */
   budgetRefreshMs: z.number().min(0).default(60000),
+  /**
+   * Общий дедлайн сбора бюджета (/api/budget), мс: четыре запроса к шлюзу не должны
+   * держать вкладку дольше. По истечении отдаём частичный ответ с error и без кеша.
+   */
+  budgetTimeoutMs: z.number().default(8000),
 })
 
 /**
@@ -499,6 +504,8 @@ function normalizeConfig(config) {
 export function apply(ctx, config) {
   const cfg = config || {}
   const catalog = normalizeConfig(cfg)
+  /** Токены конфига «как в патче»: нужны, чтобы снятие теневого токена экрана возвращало конфигную запись. */
+  const configTokens = new Map(catalog.tokens)
   /** Токены, созданные через экран: живут в stateFile, а не в конфиге оператора. */
   const uiTokens = new Map()
   /** Токены конфига, скрытые в этом DSH: запись в конфиге остаётся, экран и агенты её не видят. */
@@ -639,8 +646,10 @@ export function apply(ctx, config) {
     snapshotWarnings: [],
     /** serverName → { server, status: 'token-ok'|'token-rejected'|'token-unknown', httpCode, reason, login, checkedAt, fingerprint } */
     verify: new Map(),
-    /** Имена управляемых тулзов, которые плагин видел: по ним считается запрет даже после снятия тулза. */
+    /** Имена управляемых тулзов, которые плагин видел: только для диагностики и барьера, не для deny. */
     knownManagedTools: new Set(),
+    /** agent.label → сообщение последнего отказа tools.restrict(): гейт не применился (fail-closed, но видимо). */
+    gateErrors: new Map(),
     /** serverName → счётчик сбросов вердикта: результат проверки, начатой до записи, отбрасывается. */
     verifyEpoch: new Map(),
     /** serverName с отвергнутым токеном: тулзы сервера запрещены агентам (fail-closed), фаза degraded. */
@@ -857,9 +866,12 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     const ref = serverHeadersRef(serverName)
     if (!isOwnRef(ref)) throw new Error('ref "' + ref + '" вне пространства ' + OWN_REF_PREFIX + '*')
     if (Object.keys(headers).length === 0) {
+      // Снимок и для этого ref'а: исходное значение должно вернуться на dispose, как у ключа.
+      await snapshotCredential(ref, '')
       await ctx.credentials.unset(credentialRef(ref))
       return
     }
+    await snapshotCredential(ref, JSON.stringify(headers))
     await ctx.credentials.set(credentialRef(ref), JSON.stringify(headers))
   }
 
@@ -1316,6 +1328,18 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
   })
 
   /**
+   * Забыть имена тулзов сервера (префикс публичного имени): deny строится только по текущему
+   * реестру, а «виденные когда-то» имена нужны лишь диагностике.
+   * @param {string} serverName - серверный неймспейс сервера.
+   */
+  const forgetManagedTools = (serverName) => {
+    const prefix = 'mcp__' + serverName + '__'
+    for (const toolName of [...state.knownManagedTools]) {
+      if (toolName.startsWith(prefix)) state.knownManagedTools.delete(toolName)
+    }
+  }
+
+  /**
    * Снять сервер: dispose fiber снимает его тулзы с реестра.
    * @param {string} serverName - имя сервера в шлюзе.
    */
@@ -1328,6 +1352,9 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         log('warn', 'dispose ' + serverName + ': ' + messageOf(error))
       }
     }
+    // Имена снятых тулзов больше не нужны: deny считается по реестру, а хвост в множестве «виденных»
+    // когда-то ломал restrict() и замораживал гейт (блокер ревью 0.3.16).
+    if (mount !== undefined && mount.serverName !== undefined) forgetManagedTools(mount.serverName)
     state.mounts.delete(serverName)
   }
 
@@ -1378,6 +1405,33 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
   }
 
   /**
+   * Ошибка применения по ФАКТАМ, а не по «последнему сообщению»: точечная запись личного значения не
+   * должна стирать деградацию чужого сервера, а восстановление одного сервера — держать degraded
+   * навсегда. Порядок отражает серьёзность: реестр → ключ → статус значений → гейт → подготовка →
+   * упавшие монтирования.
+   * @param {string} prepareFailure - ошибка подготовки грантов ('' — не было).
+   * @returns {string} текст ошибки либо '' (всё в порядке).
+   */
+  const currentFailure = (prepareFailure) => {
+    // «Способ доступа не выбран» и «у токена нет ключа» — это НЕ сбой шлюза: применять нечего,
+    // экран и так показывает выбор токена и поле ключа. Иначе отключённый плагин висел в degraded
+    // с lastError «no active token» и красной плашкой (ревью M-3: отличать «нечего применять» от поломки).
+    if (state.activeToken === '') return ''
+    if (/has no keyRef|is not set \(/.test(state.registryError)) return ''
+    if (state.registryError !== '') return state.registryError
+    if (state.keyHealthError !== '') return 'ключ не подтвердился (GET /v1/models: ' + state.keyHealthError + ')'
+    if (state.envStatusError !== '') return 'статус личных значений недоступен: ' + state.envStatusError
+    if (state.gateErrors.size > 0) return 'гейт не применился: ' + [...state.gateErrors.values()][0]
+    if (prepareFailure !== '') return prepareFailure
+    const failed = [...state.mounts.values()].filter((record) => record.status === 'failed')
+    if (failed.length > 0) {
+      return 'mount ' + failed[0].name + ': ' + failed[0].error
+        + (failed.length > 1 ? ' (и ещё ' + String(failed.length - 1) + ')' : '')
+    }
+    return ''
+  }
+
+  /**
    * Монтировать сервер и дождаться активации, не полагаясь на числовой fiber.state (ревью F11):
    * семантический статус определяется наличием зарегистрированных тулзов сервера.
    * @param {object} server - нормализованный сервер.
@@ -1388,9 +1442,32 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
   /** Сколько ждать активации фибера, прежде чем считать попытку неудачной. */
   const mountTimeoutMs = Math.max(1000, Number(cfg.mountTimeoutMs) || 8000)
 
-  const mount = (server, litellmKey, personalToken, extraHeaders) => {
-    const validated = McpClient.Config(buildMcpConfig(server, litellmKey, personalToken, extraHeaders))
-    const fiber = ctx.plugin(McpClient, validated)
+  const mount = async (server, litellmKey, personalToken, extraHeaders) => {
+    let fiber
+    try {
+      const validated = McpClient.Config(buildMcpConfig(server, litellmKey, personalToken, extraHeaders))
+      fiber = ctx.plugin(McpClient, validated)
+    } catch (error) {
+      // Сбой одного сервера не должен стоить доступа всем: раньше исключение вылетало из общего
+      // цикла prepareMounts, гранты коммитились пустыми, а полный проход повторялся каждые 5 минут.
+      const reason = 'монтирование не удалось: ' + messageOf(error)
+      state.lastError = 'mount ' + server.name + ': ' + reason
+      log('warn', state.lastError)
+      journal('ERROR mount ' + server.name + ': ' + reason)
+      markSkipped(server, 'failed', reason)
+      settlePhase()
+      return undefined
+    }
+    const previous = state.mounts.get(server.name)
+    // Прежний фибер того же сервера: без dispose он переживёт смену токена и будет звать тулзы
+    // с заголовками прошлого профиля, а после возврата шлюза сервер смонтируется вторым фибером.
+    if (previous !== undefined && previous.fiber !== undefined) {
+      try {
+        await previous.fiber.dispose()
+      } catch (error) {
+        log('warn', 'dispose previous ' + server.name + ': ' + messageOf(error))
+      }
+    }
     const record = {
       name: server.name,
       status: 'starting',
@@ -1434,7 +1511,9 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         // монтируем второй фибер поверх живого: старый остался бы без учёта.
         if (state.mounts.get(server.name) !== record) return
         if (record.status !== 'starting') return
-        mount(server, litellmKey, personalToken, extraHeaders)
+        mount(server, litellmKey, personalToken, extraHeaders).catch((error) => {
+          journal('ERROR remount ' + server.name + ': ' + messageOf(error))
+        })
       }, delay)
       if (typeof timer.unref === 'function') timer.unref()
     }
@@ -1450,6 +1529,9 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       const tools = registeredTools(server.serverName)
       if (tools.length > 0) {
         record.status = 'mounted'
+        record.error = ''
+        // Сервер ожил: ошибка пересчитывается по фактам, иначе degraded держался бы до рестарта.
+        state.lastError = currentFailure('')
         journal('mount ' + server.name + ' -> mounted (' + tools.length + ' tools)')
         // прошлая проверка токена была отвергнута: не рапортуем зелёный статус до новой проверки
         if (state.tokenRejected.has(server.name)) {
@@ -1475,6 +1557,14 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
    * @param {string} [setupUrl] - ссылка на простановку значения (gateway-режим).
    */
   const markSkipped = (server, status, reason, setupUrl) => {
+    const previous = state.mounts.get(server.name)
+    // Живой фибер прошлой записи снимаем: иначе он остаётся без записи (unmountAll его не видит)
+    // и продолжает отдавать тулзы со старыми заголовками после смены токена.
+    if (previous !== undefined && previous.fiber !== undefined) {
+      Promise.resolve(previous.fiber.dispose()).catch((error) => {
+        log('warn', 'dispose skipped ' + server.name + ': ' + messageOf(error))
+      })
+    }
     state.mounts.set(server.name, {
       name: server.name,
       status,
@@ -1947,7 +2037,10 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       // Точечное применение чужие записи не переписывает: иначе транзиентная ошибка реестра
       // пометила бы «ошибкой ключа» серверы, которые на самом деле живы.
       const skipStatus = token === undefined ? 'no-active-token' : 'key-error'
-      for (const serverName of knownNames) skipKnown(serverName, skipStatus, state.registryError)
+      // Точечное применение чужие записи не переписывает (см. комментарий выше): трогаем только
+      // названные серверы, иначе транзиентный сбой ключа обнулял доступ всем.
+      const affected = only === undefined ? knownNames : knownNames.filter((serverName) => only.has(serverName))
+      for (const serverName of affected) skipKnown(serverName, skipStatus, state.registryError)
       return { grants, managedNames, ok: false }
     }
 
@@ -1959,7 +2052,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       state.registry = new Map()
       state.registryWarnings = []
       journal('ERROR registry: ' + registry.error + ' — монтирования не выполняются')
-      for (const serverName of knownNames) skipKnown(serverName, 'key-error', registry.error)
+      const affected = only === undefined ? knownNames : knownNames.filter((serverName) => only.has(serverName))
+      for (const serverName of affected) skipKnown(serverName, 'key-error', registry.error)
       return { grants, managedNames, ok: false }
     }
     state.registryError = ''
@@ -2047,7 +2141,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         markSkipped(server, 'no-env', 'gateway env missing: ' + (missing || env.missingCount + ' var(s)'), env.setupUrl)
         continue
       }
-      mount(server, key, personal, serverHeaders)
+      await mount(server, key, personal, serverHeaders)
     }
     // Серверы, которых нет в реестре шлюза (описаны только в конфиге плагина), в цикле выше не участвуют:
     // если такому нужен личный ключ и его нет — это «нет личного ключа», а не «не подключён».
@@ -2462,6 +2556,9 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       const providerRef = String(cfg.llmSecretRef || '')
       if (isOwnRef(providerRef)) {
         try {
+          // Без снимка ref провайдера уничтожался безвозвратно: значение оператора не вернуть
+          // ни на dispose, ни после удаления последнего токена (остаток класса P1-2).
+          await snapshotCredential(providerRef, '')
           await ctx.credentials.unset(credentialRef(providerRef))
           journal('models: no active token — unset provider ref ' + providerRef)
         } catch (error) {
@@ -2597,18 +2694,18 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
    */
   const desiredDenied = (record) => {
     void record
-    // Запрет считается по объединению «сейчас в реестре» и «когда-либо видели»: restrict() сам
-    // эмитит tools/change, набор уменьшался после каждого применения и гейт зацикливался
-    // (в журнале десятки строк denied=9…2 на одно применение).
-    const names = new Set(state.knownManagedTools)
+    // Имена берём ТОЛЬКО из текущего реестра: tools.restrict() валидирует их и падает на тех,
+    // которых в реестре уже нет (сервер размонтирован). Исторические имена (knownManagedTools)
+    // нужны диагностике и барьеру: подмешать их в deny значит навсегда заморозить слой запретов —
+    // после смены профиля restrict отказывал, ошибка глоталась, и M2 больше не включался.
+    const names = []
     for (const toolName of globalMcpToolNames()) {
       if (!isManagedTool(toolName)) continue
-      names.add(toolName)
+      names.push(toolName)
       state.knownManagedTools.add(toolName)
     }
-    const list = [...names]
-    if (state.barrier) return list
-    return list.filter((toolName) => !toolAllowed(toolName))
+    if (state.barrier) return names
+    return names.filter((toolName) => !toolAllowed(toolName))
   }
 
   /**
@@ -2708,6 +2805,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     }
     record.disposers = []
     record.hidden = new Set()
+    state.gateErrors.delete(record.label)
   }
 
   /**
@@ -2734,9 +2832,14 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       const message = messageOf(error)
       log('warn', 'tools.restrict() отказал у агента ' + record.label + ': ' + message)
       journal('ERROR restrict agent=' + record.label + ': ' + message)
+      // Отказ гейта — деградация, а не тихий лог: иначе экран рапортует ready, пока агенты сидят
+      // на слое прошлого поколения (блокер ревью 0.3.16).
+      state.gateErrors.set(record.label, message)
+      settlePhase()
       // Старые запреты остаются в силе: лучше устаревший запрет, чем открытый доступ.
       return
     }
+    state.gateErrors.delete(record.label)
     const previous = record.disposers
     record.disposers = [disposer]
     record.hidden = new Set(desired)
@@ -2820,7 +2923,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     retryTimer = setTimeout(() => {
       retryTimer = undefined
       retryState.nextRetryAt = 0
-      applyActiveToken('auto-retry#' + retryState.attempts).catch((error) => {
+      retryLight('auto-retry#' + retryState.attempts).catch((error) => {
         journal('ERROR auto-retry: ' + messageOf(error))
         scheduleRetry()
       })
@@ -2829,11 +2932,52 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
   }
 
   /**
+   * Есть ли что применять: без активного токена, без keyRef или без грантов повтор бессмысленен.
+   * Полный проход с барьером раз в 5 минут в этом состоянии только отбирал тулзы у всех агентов.
+   * @returns {boolean} true — применять нечего (это не деградация).
+   */
+  const applyIsIdle = () => {
+    if (state.activeToken === '') return true
+    const token = activeGrant()
+    if (token === undefined) return true
+    if (token.keyRef === '') return true
+    if (/no active token|has no keyRef|is not set/.test(state.registryError)) return true
+    if (state.grants.size === 0 && state.mounts.size === 0) return true
+    return false
+  }
+
+  /**
+   * Лёгкий повтор: сначала пробуем ТОЛЬКО упавшие монтирования (точечно, без барьера), и лишь когда
+   * причина — реестр/ключ, идём полным проходом. Раньше каждый тик снимал тулзы у всех агентов.
+   * @param {string} reason - метка для журнала.
+   * @returns {Promise<void>} завершение повтора.
+   */
+  const retryLight = async (reason) => {
+    const failed = [...state.mounts.values()]
+      .filter((record) => record.status === 'failed')
+      .map((record) => record.name)
+    if (failed.length > 0 && state.registryError === '' && state.keyHealthError === '') {
+      journal('retry ' + reason + ': только упавшие серверы (' + failed.join(',') + ')')
+      return applyServers(reason, failed)
+    }
+    return applyActiveToken(reason)
+  }
+
+  /**
    * Итог применения: успех сбрасывает авто-ретрай, ошибка — планирует следующий повтор.
+   * «Нечего применять» ретраев не заслуживает: ждём действия человека, а не шлём полный проход.
    */
   const settleRetry = () => {
-    if (state.lastError === '') resetRetry()
-    else scheduleRetry()
+    if (state.lastError === '') {
+      resetRetry()
+      return
+    }
+    if (applyIsIdle()) {
+      if (retryState.attempts > 0) journal('retry off: применять нечего (' + state.lastError + ')')
+      resetRetry()
+      return
+    }
+    scheduleRetry()
   }
 
   /* ─────────────────────── двухфазное применение токена ─────────────────────── */
@@ -2913,11 +3057,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     for (const [serverName, previous] of restoreRecords) {
       if (!state.mounts.has(serverName)) state.mounts.set(serverName, previous)
     }
-    if (prepared.ok) state.lastError = failure
-    else if (state.registryError !== '') state.lastError = state.registryError
-    else if (state.keyHealthError !== '') state.lastError = 'ключ не подтвердился (GET /v1/models: ' + state.keyHealthError + ')'
-    else if (state.envStatusError !== '') state.lastError = 'статус личных значений недоступен: ' + state.envStatusError
-    else state.lastError = failure
+    // Факты, а не «последнее сообщение»: точечное применение чужую деградацию не стирает.
+    state.lastError = currentFailure(failure)
     if (targeted === undefined) {
       try {
         await applyModelAccess(state.activeToken)
@@ -3005,7 +3146,10 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
    * @returns {Promise<{activeToken: string, tokens: object[], hidden: string[]}>} прочитанное состояние.
    */
   const loadStateDoc = async () => {
-    const fallback = { activeToken: cfg.activeToken || '', tokens: [], hidden: [] }
+    // exists=false — файла ещё нет (первый запуск): работаем на конфиге. exists=true при activeToken:'' —
+    // это решение человека «Отключить», и оно должно переживать рестарт: раньше cfg.activeToken
+    // применялся ДО чтения файла, и отключение отменялось самим запуском.
+    const fallback = { exists: false, activeToken: null, tokens: [], hidden: [], serverNames: [] }
     if (stateFile === '') return fallback
     let parsed
     try {
@@ -3015,7 +3159,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     }
     if (parsed === null || typeof parsed !== 'object') return fallback
     return {
-      activeToken: typeof parsed.activeToken === 'string' ? parsed.activeToken : (cfg.activeToken || ''),
+      exists: true,
+      activeToken: typeof parsed.activeToken === 'string' ? parsed.activeToken : null,
       tokens: Array.isArray(parsed.tokens) ? parsed.tokens.map(normalizeUiToken).filter((token) => token !== undefined) : [],
       hidden: Array.isArray(parsed.hiddenTokens) ? parsed.hiddenTokens.map((id) => String(id)).filter((id) => id !== '') : [],
       serverNames: Array.isArray(parsed.serverNames) ? parsed.serverNames.map((name) => String(name)).filter((name) => name !== '') : [],
@@ -3292,28 +3437,55 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
 
   /** Последний ответ шлюза о бюджете: id токена, когда спросили и что ответили. */
   const budgetCache = { tokenId: '', at: 0, data: null }
+  /** Сбор бюджета «в полёте»: параллельные запросы делят один поход в шлюз (single-flight). */
+  const budgetPending = { tokenId: '', promise: null }
 
   /**
-   * Деньги ключа в шлюзе: расход и лимиты. LiteLLM считает spend сам (LiteLLM_SpendLogs) и
-   * отдаёт его виртуальному ключу по GET /key/info; лимит владельца ключа с окном
-   * budget_duration — по GET /user/info. У ключа лимита может не быть (max_budget: null) —
-   * тогда ограничивает только бюджет пользователя.
-   * @param {{id: string, keyRef: string}} token - активный токен.
-   * @returns {Promise<object>} блок budget для /api/state.
+   * Кеш бюджета без обращения к сети: /api/state отдаёт уже посчитанное (или null), чтобы состояние
+   * плагина не ждало шлюз. Свежие числа тянет отдельный маршрут /api/budget.
+   * @param {string} tokenId - активный токен.
+   * @returns {object|null} блок budget либо null, если для этого токена ещё не считали.
    */
-  const describeBudget = async (token) => {
+  const budgetPeek = (tokenId) => {
+    if (budgetCache.data === null || budgetCache.tokenId !== tokenId) return null
     const ttl = Math.max(0, Number(cfg.budgetRefreshMs) || 0)
-    if (budgetCache.data !== null && budgetCache.tokenId === token.id && Date.now() - budgetCache.at < ttl) {
-      return budgetCache.data
-    }
+    return Object.assign({ stale: Date.now() - budgetCache.at >= ttl }, budgetCache.data)
+  }
+
+  /** Сбросить кеш бюджета: ключ токена сменился, показывать суммы прошлого аккаунта нельзя. */
+  const invalidateBudget = () => {
+    budgetCache.tokenId = ''
+    budgetCache.at = 0
+    budgetCache.data = null
+  }
+
+  /**
+   * Собрать блок бюджета у шлюза: key/user/spend — параллельно, team — после user (нужен team_id).
+   * Кеш не трогает: запись делает describeBudget, и только для успешного ответа.
+   * @param {{id: string, keyRef: string}} token - активный токен.
+   * @returns {Promise<object>} блок budget.
+   */
+  const collectBudget = async (token) => {
     const key = token.keyRef !== '' ? await readSecret(token.keyRef) : ''
     if (key === '') {
-      return { tokenId: token.id, key: null, user: null, team: null, today: null, error: 'ключ токена не задан', fetchedAt: Date.now() }
+      return { tokenId: token.id, key: null, user: null, team: null, today: null, week: { days: [], total: null }, error: 'ключ токена не задан', fetchedAt: Date.now() }
     }
     /** Число из ответа шлюза либо null: LiteLLM кладёт в поля null, когда лимит не задан. */
     const numOf = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null)
-    const keyAnswer = await gatewayGet('/key/info', key)
-    const userAnswer = await gatewayGet('/user/info', key)
+    const pad = (value) => String(value).padStart(2, '0')
+    const dayOf = (date) => date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
+    const today = dayOf(new Date())
+    const tomorrowDate = new Date(Date.now() + 86400000)
+    const weekStartDate = new Date(Date.now() - 6 * 86400000)
+    // Три независимых запроса идут параллельно: последовательно они складывали свои таймауты.
+    const answers = await Promise.all([
+      gatewayGet('/key/info', key),
+      gatewayGet('/user/info', key),
+      gatewayGet('/spend/logs?start_date=' + dayOf(weekStartDate) + '&end_date=' + dayOf(tomorrowDate), key),
+    ])
+    const keyAnswer = answers[0]
+    const userAnswer = answers[1]
+    const spendAnswer = answers[2]
     const info = keyAnswer.body !== undefined && keyAnswer.body !== null && keyAnswer.body.info ? keyAnswer.body.info : null
     const userInfo = userAnswer.body !== undefined && userAnswer.body !== null && userAnswer.body.user_info ? userAnswer.body.user_info : null
     // Группа = команда LiteLLM, в которую ADFS кладёт пользователя; имя AD-группы лежит в metadata.
@@ -3325,16 +3497,6 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     const teamInfo = teamAnswer.body !== undefined && teamAnswer.body !== null && teamAnswer.body.team_info
       ? teamAnswer.body.team_info
       : null
-    // Расход по дням: тот же /spend/logs, но с датами — шлюз отдаёт дневную сводку вместо строк лога.
-    const pad = (value) => String(value).padStart(2, '0')
-    const dayOf = (date) => date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
-    const today = dayOf(new Date())
-    const tomorrowDate = new Date(Date.now() + 86400000)
-    const weekStartDate = new Date(Date.now() - 6 * 86400000)
-    const spendAnswer = await gatewayGet(
-      '/spend/logs?start_date=' + dayOf(weekStartDate) + '&end_date=' + dayOf(tomorrowDate),
-      key
-    )
     const rowByDay = new Map()
     if (Array.isArray(spendAnswer.body)) {
       for (const entry of spendAnswer.body) {
@@ -3415,11 +3577,69 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       error: keyAnswer.error || userAnswer.error || teamAnswer.error || spendAnswer.error || '',
       fetchedAt: Date.now(),
     }
-    budgetCache.tokenId = token.id
-    budgetCache.at = Date.now()
-    budgetCache.data = data
-    if (data.error !== '') journal('бюджет: ' + data.error)
     return data
+  }
+
+  /**
+   * Деньги ключа в шлюзе: расход и лимиты. LiteLLM считает spend сам (LiteLLM_SpendLogs) и отдаёт его
+   * виртуальному ключу по GET /key/info; лимит владельца ключа с окном budget_duration — по GET
+   * /user/info. У ключа лимита может не быть (max_budget: null) — тогда ограничивает бюджет
+   * пользователя. Кешируется только успех (ошибка не залипает на TTL), параллельные вызовы делят
+   * один поход в шлюз, а общий дедлайн не даёт вкладке ждать молчащий шлюз.
+   * @param {{id: string, keyRef: string}} token - активный токен.
+   * @returns {Promise<object>} блок budget.
+   */
+  const describeBudget = async (token) => {
+    const ttl = Math.max(0, Number(cfg.budgetRefreshMs) || 0)
+    if (budgetCache.data !== null && budgetCache.tokenId === token.id && Date.now() - budgetCache.at < ttl) {
+      return budgetCache.data
+    }
+    if (budgetPending.promise !== null && budgetPending.tokenId === token.id) return budgetPending.promise
+    const timeoutMs = Math.max(1000, Number(cfg.budgetTimeoutMs) || 8000)
+    const promise = (async () => {
+      /** Частичный ответ по дедлайну: экран должен сказать «не успели», а не висеть. */
+      const partial = {
+        tokenId: token.id,
+        key: null,
+        user: null,
+        team: null,
+        today: null,
+        week: { days: [], total: null },
+        error: 'шлюз не ответил за ' + String(Math.round(timeoutMs / 1000)) + ' с',
+        fetchedAt: Date.now(),
+      }
+      let timer = null
+      const deadline = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(partial), timeoutMs)
+      })
+      try {
+        const data = await Promise.race([collectBudget(token), deadline])
+        if (data === partial) {
+          journal('бюджет: ' + partial.error)
+          return partial
+        }
+        if (data.error === '') {
+          budgetCache.tokenId = token.id
+          budgetCache.at = Date.now()
+          budgetCache.data = data
+        } else {
+          journal('бюджет: ' + data.error)
+        }
+        return data
+      } finally {
+        if (timer !== null) clearTimeout(timer)
+      }
+    })()
+    budgetPending.tokenId = token.id
+    budgetPending.promise = promise
+    const clear = () => {
+      if (budgetPending.promise === promise) {
+        budgetPending.promise = null
+        budgetPending.tokenId = ''
+      }
+    }
+    promise.then(clear, clear)
+    return promise
   }
 
   /**
@@ -3551,13 +3771,13 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         })),
       })
     }
-    const activeTokenRecord = catalog.tokens.get(state.activeToken)
     return {
       activeToken: state.activeToken,
-      /** Деньги активного ключа в шлюзе: расход ключа и недельный лимит его владельца. */
-      budget: activeTokenRecord === undefined
-        ? { tokenId: '', key: null, user: null, error: 'активный токен не выбран', fetchedAt: Date.now() }
-        : await describeBudget(activeTokenRecord),
+      /**
+       * Деньги активного ключа — только из кеша, без похода в шлюз: состояние плагина не должно
+       * ждать статистику. null значит «ещё не считали»; свежие числа отдаёт /api/budget.
+       */
+      budget: budgetPeek(state.activeToken),
       /** Скрытые токены конфига: записи в конфиге живы, экран и гранты их не видят. */
       hiddenTokens: [...hiddenTokens].map((id) => {
         const token = catalog.tokens.get(id)
@@ -3571,6 +3791,11 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       configErrors,
       configWarnings: state.configWarnings,
       registryWarnings: state.registryWarnings,
+      /**
+       * Отказы tools.restrict (агент → сообщение): гейт не применился, слой остался прежним.
+       * Пусто — все живые агенты сидят на актуальном наборе запретов.
+       */
+      gateErrors: [...state.gateErrors.entries()].map((entry) => ({ agent: entry[0], error: entry[1] })),
       snapshotWarnings: state.snapshotWarnings,
       lastError: state.lastError,
       retry: describeRetry(),
@@ -3993,6 +4218,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         return json(res, 400, { error: 'token "' + token.id + '": keyRef "' + (token.keyRef || '(пусто)') + '" вне пространства ' + OWN_REF_PREFIX + '* — запись запрещена' })
       }
       const value = typeof body.value === 'string' ? body.value : ''
+      await snapshotCredential(token.keyRef, value)
       if (value === '') {
         await ctx.credentials.unset(credentialRef(token.keyRef))
         journal('token key cleared token=' + token.id + ' ref=' + token.keyRef)
@@ -4000,6 +4226,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         await ctx.credentials.set(credentialRef(token.keyRef), value)
         journal('token key set token=' + token.id + ' ref=' + token.keyRef + ' length=' + value.length)
       }
+      // Новый ключ — это, возможно, другой аккаунт: кеш прошлых сумм недействителен.
+      invalidateBudget()
       if (token.id === state.activeToken) await applyActiveToken('token-key-write')
       return json(res, 200, await describeState())
     } catch (error) {
@@ -4186,6 +4414,13 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         }
         uiTokens.delete(tokenId)
         catalog.tokens.delete(tokenId)
+        // Тот же id есть в конфиге оператора: удаление токена экрана возвращает конфигную запись,
+        // а не стирает её вместе с правами.
+        const fromConfig = configTokens.get(tokenId)
+        if (fromConfig !== undefined) {
+          catalog.tokens.set(tokenId, fromConfig)
+          journal('token removed: восстановлена конфигная запись ' + tokenId)
+        }
       } else {
         hiddenTokens.add(tokenId)
       }
@@ -4363,7 +4598,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
 
   installModelGate()
 
-  if (cfg.activeToken !== '' && catalog.tokens.has(cfg.activeToken)) state.activeToken = cfg.activeToken
+  // Стартовый activeToken решается ПОСЛЕ чтения stateFile (см. startup): конфиг — только фолбэк для
+  // первого запуска, иначе «Отключить»/«Скрыть» не переживали рестарт.
 
   for (const error of configErrors) {
     log('error', error)
@@ -4377,17 +4613,49 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     await installGatewayRoute()
     await initJournalSize()
     const persisted = await loadStateDoc()
-    for (const token of persisted.tokens) {
-      uiTokens.set(token.id, token)
-      catalog.tokens.set(token.id, token)
-    }
+    for (const token of persisted.tokens) uiTokens.set(token.id, token)
     for (const id of persisted.hidden) hiddenTokens.add(id)
+    for (const token of persisted.tokens) {
+      const fromConfig = configTokens.get(token.id)
+      if (fromConfig === undefined) {
+        catalog.tokens.set(token.id, token)
+        continue
+      }
+      // Токен есть и в конфиге, и в файле состояния: права (models/group/servers) берём из конфига,
+      // иначе профиль молча получал ВСЕ модели ключа — сужение models[] терялось без единого варнинга.
+      const merged = Object.assign({}, token, {
+        models: fromConfig.models.length > 0 ? fromConfig.models : token.models,
+        group: fromConfig.group !== '' ? fromConfig.group : token.group,
+        source: fromConfig.source,
+        servers: token.servers.size > 0 ? token.servers : fromConfig.servers,
+      })
+      const warning = 'токен "' + token.id + '" есть и в конфиге, и в файле состояния: права взяты из конфига'
+        + ' (models=' + String(merged.models.length) + ', servers=' + String(merged.servers.size) + ')'
+      if (!state.configWarnings.includes(warning)) state.configWarnings.push(warning)
+      journal('WARN ' + warning)
+      uiTokens.set(token.id, merged)
+      catalog.tokens.set(token.id, merged)
+    }
     // Состав серверов из прошлого запуска: если токена нет, экран покажет строки с причиной.
     if (Array.isArray(persisted.serverNames)) state.lastServerNames = [...persisted.serverNames]
-    if (persisted.activeToken !== '' && hasToken(persisted.activeToken)) state.activeToken = persisted.activeToken
-    else if (persisted.activeToken !== '') {
-      log('warn', 'persisted activeToken "' + persisted.activeToken + '" недоступен (нет в конфиге или скрыт) — остаётся "'
-        + state.activeToken + '"')
+    if (!persisted.exists) {
+      // Первый запуск: подключаемся тем, что дал оператор в конфиге.
+      state.activeToken = cfg.activeToken !== '' && hasToken(cfg.activeToken) ? cfg.activeToken : ''
+    } else {
+      const wanted = persisted.activeToken === null ? '' : persisted.activeToken
+      if (wanted !== '' && hasToken(wanted)) {
+        state.activeToken = wanted
+      } else if (wanted !== '') {
+        // Скрытый или исчезнувший токен не может быть активным невидимо: иначе экран пишет
+        // «Способ доступа не выбран», а профиль работает и /api/active на его id отдаёт 404.
+        const why = hiddenTokens.has(wanted) ? 'скрыт' : 'нет в конфиге'
+        log('warn', 'persisted activeToken "' + wanted + '" ' + why + ' — доступ не применяется')
+        journal('WARN persisted activeToken "' + wanted + '" ' + why + ': доступ выключен, выберите токен на экране')
+        state.activeToken = ''
+      } else {
+        // Пустая строка в файле — это «Отключить»; конфиг её не отменяет.
+        state.activeToken = ''
+      }
     }
     // R2-b: восстановление из durable-снимка имеет приоритет над захватом ref'а ключом токена.
     try {

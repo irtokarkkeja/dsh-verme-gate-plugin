@@ -111,7 +111,7 @@ check('F11: нет хрупкого сравнения fiber.state === 3', !sour
 check('F3/F7: фолбэк каталога и запрет монтирования при битом ключе',
   source.includes('keyHealthError') && source.includes('degraded'))
 check('F5/P2: причина отказа видна в состоянии (markSkipped на ошибке ключа/реестра)',
-  source.includes("for (const serverName of knownNames) skipKnown(serverName, 'key-error', registry.error)")
+  source.includes("for (const serverName of affected) skipKnown(serverName, 'key-error', registry.error)")
   && source.includes('const skipKnown = (serverName, status, reason) =>')
   && source.includes("skipKnown(serverName, skipStatus, state.registryError)")
   && source.includes("markSkipped(server, 'key-error', 'ключ не подтвердился"))
@@ -298,7 +298,8 @@ check('FR-020f: монтирование повторяется, статус п
 check('FR-017e: без активного токена список серверов не исчезает',
   source.includes('const knownEntries = serverEntries()')
   && source.includes('const knownNames = knownEntries.length > 0')
-  && source.includes("for (const serverName of knownNames) skipKnown(serverName, skipStatus, state.registryError)")
+  && source.includes("const affected = only === undefined ? knownNames : knownNames.filter((serverName) => only.has(serverName))")
+  && source.includes("for (const serverName of affected) skipKnown(serverName, skipStatus, state.registryError)")
   && source.includes('serverNames: [...state.lastServerNames]')
   && source.includes('if (Array.isArray(persisted.serverNames)) state.lastServerNames = [...persisted.serverNames]'))
 check('NFR-003: чужая ошибка попадает в журнал без похожего на секрет текста',
@@ -329,6 +330,54 @@ check('FR-020: экран знает id записи шлюза, по котор
   source.includes('const envVarTarget = async (serverName) =>')
   && source.includes('serverId: (env !== undefined && env.serverId !== \'\' ? env.serverId : \'\')')
   && source.includes('envRequired: env ? env.required : []'))
+
+check('деньги: /api/state не ждёт шлюз — только кеш бюджета',
+  source.includes('budget: budgetPeek(state.activeToken)')
+  && !source.includes('await describeBudget(activeTokenRecord)'))
+check('деньги: сбор бюджета один на всех (single-flight), с дедлайном и без кеша ошибок',
+  source.includes('budgetPending')
+  && source.includes('Promise.race([collectBudget(token), deadline])')
+  && source.includes('budgetTimeoutMs')
+  && source.includes("if (data.error === '') {"))
+check('деньги: смена ключа сбрасывает кеш прошлого аккаунта', source.includes('invalidateBudget()'))
+check('деньги: карточка и чип тянут /api/budget сами, состояние даёт только кеш',
+  client.includes('function useBudgetFeed')
+  && client.includes('useBudgetFeed({ initial: props.initial })')
+  && client.includes('useBudgetFeed({ live: true })')
+  && client.includes('h(BudgetCard, { initial: data.budget })'))
+
+check('гейт: deny собирается только из текущего реестра, без «когда-либо виденных» имён',
+  source.includes('const names = []')
+  && source.includes('if (!isManagedTool(toolName)) continue')
+  && !source.includes('const names = new Set(state.knownManagedTools)'))
+check('гейт: размонтирование забывает имена тулзов сервера',
+  source.includes('const forgetManagedTools = (serverName) =>')
+  && source.includes('forgetManagedTools(mount.serverName)'))
+check('гейт: отказ restrict поднимает деградацию, а не тонет в журнале',
+  source.includes('state.gateErrors.set(record.label, message)')
+  && source.includes('gateErrors: [...state.gateErrors.entries()]')
+  && source.includes("if (state.gateErrors.size > 0) return 'гейт не применился: '"))
+check('монтирование изолировано по серверам: Config/ctx.plugin под try',
+  source.includes('fiber = ctx.plugin(McpClient, validated)')
+  && source.includes("markSkipped(server, 'failed', reason)"))
+check('фаза по фактам: точечное применение не стирает деградацию чужого сервера',
+  source.includes('state.lastError = currentFailure(failure)')
+  && source.includes('const currentFailure = (prepareFailure) =>'))
+check('повтор не снимает тулзы: «нечего применять» без ретраев, упавшие — точечно',
+  source.includes('const applyIsIdle = () =>')
+  && source.includes("retryLight('auto-retry#' + retryState.attempts)")
+  && source.includes("journal('retry ' + reason + ': только упавшие серверы ('"))
+check('старт: stateFile решает «подключено/отключено», конфиг — фолбэк первого запуска',
+  source.includes('if (!persisted.exists) {')
+  && source.includes('// Пустая строка в файле — это «Отключить»; конфиг её не отменяет.')
+  && !source.includes("if (cfg.activeToken !== '' && catalog.tokens.has(cfg.activeToken)) state.activeToken = cfg.activeToken"))
+check('старт: токен экрана с тем же id, что в конфиге, не теряет сужение models[]',
+  source.includes('const merged = Object.assign({}, token, {')
+  && source.includes('права взяты из конфига'))
+check('снимки: ref провайдера и личные значения снимаются перед записью/снятием',
+  source.includes("await snapshotCredential(providerRef, '')")
+  && source.includes('await snapshotCredential(token.keyRef, value)')
+  && source.includes('await snapshotCredential(ref, JSON.stringify(headers))'))
 
 console.log('')
 console.log(failures === 0 ? 'selftest: PASS' : 'selftest: FAIL (' + failures + ')')

@@ -876,14 +876,69 @@ function spendTone(spend, maxBudget) {
 }
 
 /**
+ * Загрузчик денег: тянет /api/budget отдельно от /api/state, чтобы статистика не держала
+ * остальной экран. Пока ответа нет — status 'loading'; ошибка сети — status 'error' (данные,
+ * если они уже были, сохраняются).
+ * @param {{initial?: object|null, live?: boolean}} options - кеш из состояния и режим опроса.
+ * @returns {{data: object|null, status: string}} данные и состояние загрузки.
+ */
+function useBudgetFeed(options) {
+  const settings = options !== null && options !== undefined ? options : {}
+  const initial = settings.initial !== null && settings.initial !== undefined ? settings.initial : null
+  const live = settings.live === true
+  const [data, setData] = useState(initial)
+  const [status, setStatus] = useState(initial === null ? 'loading' : 'ready')
+  useEffect(() => {
+    let disposed = false
+    let timer
+    const load = () => {
+      callApi('GET', '/budget').then((payload) => {
+        if (disposed) return
+        setData(payload)
+        setStatus('ready')
+      }).catch(() => {
+        if (!disposed) setStatus('error')
+      })
+    }
+    // Расход во шлюзе флашится раз в ~10 с, а лимит меняется ещё медленнее: минуты хватает.
+    const schedule = () => {
+      window.clearTimeout(timer)
+      if (disposed) return
+      timer = window.setTimeout(() => {
+        if (!document.hidden) load()
+        schedule()
+      }, 60000)
+    }
+    load()
+    if (live) schedule()
+    return () => {
+      disposed = true
+      window.clearTimeout(timer)
+    }
+  }, [live])
+  return { data, status }
+}
+
+/**
  * Бюджет активного ключа: расход и лимиты из /key/info и /user/info шлюза.
- * @param {{budget: object|undefined}} props - блок budget из /api/state.
+ * Данные тянет сам (/api/budget): в состоянии экрана лежит только кеш, чтобы /api/state
+ * не ждал статистику.
+ * @param {{initial: object|null|undefined}} props - кеш бюджета из /api/state.
  * @returns {object} карточка.
  */
 function BudgetCard(props) {
   const [expandModels, setExpandModels] = useState(false)
   const [activeDay, setActiveDay] = useState('')
-  const budget = props.budget !== null && props.budget !== undefined ? props.budget : {}
+  const feed = useBudgetFeed({ initial: props.initial })
+  if (feed.status === 'loading' && feed.data === null) {
+    return h('div', { className: 'dshMcpCard' },
+      h('div', { className: 'dshMcpCardHead' },
+        h('div', null,
+          h('h3', { className: 'dshMcpCardTitle' }, 'Деньги: сколько осталось'),
+          h('p', { className: 'dshMcpCardNote' }, 'Считаем статистику шлюза — остальные настройки уже доступны.'))),
+      h('p', { className: 'dshMcpFoot' }, 'Загружаем расход и лимит ключа из шлюза…'))
+  }
+  const budget = feed.data !== null ? feed.data : {}
   const key = budget.key !== null && budget.key !== undefined ? budget.key : null
   const user = budget.user !== null && budget.user !== undefined ? budget.user : null
   const team = budget.team !== null && budget.team !== undefined ? budget.team : null
@@ -1022,39 +1077,10 @@ function BudgetCard(props) {
  * @returns {object|null} чип либо null, когда шлюз молчит или лимита нет.
  */
 function BudgetChip() {
-  const [data, setData] = useState(null)
-  const [failed, setFailed] = useState(false)
   const [open, setOpen] = useState(false)
-  useEffect(() => {
-    let disposed = false
-    let timer
-    const load = () => {
-      callApi('GET', '/budget').then((payload) => {
-        if (!disposed) {
-          setData(payload)
-          setFailed(false)
-        }
-      }).catch(() => {
-        if (!disposed) setFailed(true)
-      })
-    }
-    // Расход во шлюзе флашится раз в ~10 с, а лимит меняется ещё медленнее: минуты хватает.
-    const schedule = () => {
-      window.clearTimeout(timer)
-      if (disposed) return
-      timer = window.setTimeout(() => {
-        if (!document.hidden) load()
-        schedule()
-      }, 60000)
-    }
-    load()
-    schedule()
-    return () => {
-      disposed = true
-      window.clearTimeout(timer)
-    }
-  }, [])
-  if (failed || data === null || data === undefined) return null
+  const feed = useBudgetFeed({ live: true })
+  const data = feed.data
+  if (feed.status === 'error' || data === null || data === undefined) return null
   const user = data.user !== null && data.user !== undefined ? data.user : null
   const key = data.key !== null && data.key !== undefined ? data.key : null
   const team = data.team !== null && data.team !== undefined ? data.team : null
@@ -1179,7 +1205,7 @@ function AccessTab(props) {
         : h('p', { className: 'dshMcpFoot' },
           h('span', null, 'Скрытые: ' + hiddenTokens.map((token) => token.label).join(', ') + ' '),
           h(Button, { variant: 'outline', onClick: restoreAll }, 'Вернуть'))),
-    h(BudgetCard, { budget: data.budget }),
+    h(BudgetCard, { initial: data.budget }),
     dialog !== null && dialog.kind === 'connect'
       ? h(ConnectKeyDialog, {
         onClose: () => setDialog(null),
