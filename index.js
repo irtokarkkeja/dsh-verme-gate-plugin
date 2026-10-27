@@ -3308,14 +3308,44 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     }
     const key = token.keyRef !== '' ? await readSecret(token.keyRef) : ''
     if (key === '') {
-      return { tokenId: token.id, key: null, user: null, error: 'ключ токена не задан', fetchedAt: Date.now() }
+      return { tokenId: token.id, key: null, user: null, team: null, today: null, error: 'ключ токена не задан', fetchedAt: Date.now() }
     }
-    const keyAnswer = await gatewayGet('/key/info', key)
-    const userAnswer = await gatewayGet('/user/info', key)
     /** Число из ответа шлюза либо null: LiteLLM кладёт в поля null, когда лимит не задан. */
     const numOf = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null)
+    const keyAnswer = await gatewayGet('/key/info', key)
+    const userAnswer = await gatewayGet('/user/info', key)
     const info = keyAnswer.body !== undefined && keyAnswer.body !== null && keyAnswer.body.info ? keyAnswer.body.info : null
     const userInfo = userAnswer.body !== undefined && userAnswer.body !== null && userAnswer.body.user_info ? userAnswer.body.user_info : null
+    // Группа = команда LiteLLM, в которую ADFS кладёт пользователя; имя AD-группы лежит в metadata.
+    const teamIds = userInfo !== null && Array.isArray(userInfo.teams) ? userInfo.teams.map(String) : []
+    const teamId = teamIds.length > 0 ? teamIds[0] : ''
+    const teamAnswer = teamId === ''
+      ? { body: undefined, error: '' }
+      : await gatewayGet('/team/info?team_id=' + encodeURIComponent(teamId), key)
+    const teamInfo = teamAnswer.body !== undefined && teamAnswer.body !== null && teamAnswer.body.team_info
+      ? teamAnswer.body.team_info
+      : null
+    // Расход за сегодня: тот же /spend/logs, но с датами — шлюз отдаёт дневную сводку вместо строк лога.
+    const pad = (value) => String(value).padStart(2, '0')
+    const dayOf = (date) => date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
+    const today = dayOf(new Date())
+    const tomorrowDate = new Date(Date.now() + 86400000)
+    const spendAnswer = await gatewayGet('/spend/logs?start_date=' + today + '&end_date=' + dayOf(tomorrowDate), key)
+    let todaySpend = null
+    let todayModels = []
+    if (Array.isArray(spendAnswer.body)) {
+      const row = spendAnswer.body.find((entry) => entry !== null && entry !== undefined && String(entry.startTime || '') === today)
+      if (row !== undefined && row !== null) {
+        todaySpend = numOf(row.spend)
+        const models = row.models !== null && row.models !== undefined && typeof row.models === 'object' ? row.models : {}
+        todayModels = Object.keys(models)
+          .map((name) => ({ model: name, spend: numOf(models[name]) || 0 }))
+          .sort((left, right) => right.spend - left.spend)
+          .slice(0, 3)
+      } else if (spendAnswer.body.length > 0) {
+        todaySpend = 0
+      }
+    }
     const data = {
       tokenId: token.id,
       key: info === null ? null : {
@@ -3329,15 +3359,33 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         blocked: info.blocked === true,
         models: Array.isArray(info.models) ? info.models.length : 0,
         lastActive: String(info.last_active || ''),
+        owner: info.metadata !== null && info.metadata !== undefined && info.metadata.owner ? String(info.metadata.owner) : '',
+        purpose: info.metadata !== null && info.metadata !== undefined && info.metadata.purpose ? String(info.metadata.purpose) : '',
       },
       user: userInfo === null ? null : {
         id: String(userInfo.user_id || ''),
+        alias: String(userInfo.user_alias || ''),
+        role: String(userInfo.user_role || ''),
         maxBudget: numOf(userInfo.max_budget),
         spend: numOf(userInfo.spend),
         budgetDuration: String(userInfo.budget_duration || ''),
         resetAt: String(userInfo.budget_reset_at || ''),
+        keys: Array.isArray(userInfo.keys) ? userInfo.keys.length : 0,
       },
-      error: keyAnswer.error || userAnswer.error || '',
+      team: teamInfo === null ? null : {
+        id: String(teamInfo.team_id || teamId),
+        alias: String(teamInfo.team_alias || ''),
+        adfsGroup: teamInfo.metadata !== null && teamInfo.metadata !== undefined && teamInfo.metadata.adfs_group
+          ? String(teamInfo.metadata.adfs_group)
+          : '',
+        members: Array.isArray(teamInfo.members_with_roles) ? teamInfo.members_with_roles.length : 0,
+        spend: numOf(teamInfo.spend),
+        maxBudget: numOf(teamInfo.max_budget),
+        budgetDuration: String(teamInfo.budget_duration || ''),
+        resetAt: String(teamInfo.budget_reset_at || ''),
+      },
+      today: todaySpend === null ? null : { day: today, spend: todaySpend, models: todayModels },
+      error: keyAnswer.error || userAnswer.error || teamAnswer.error || spendAnswer.error || '',
       fetchedAt: Date.now(),
     }
     budgetCache.tokenId = token.id
@@ -4199,6 +4247,14 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       if (prompt.error !== undefined) return json(res, 400, prompt)
       journal('prompts: выдан "' + prompt.id + '" (' + prompt.text.length + ' символов)')
       json(res, 200, prompt)
+    })
+    // Деньги активного ключа для чипа под композером: тот же расчёт, что в /api/state.budget,
+    // но отдельным маршрутом — чип живёт в разговоре, вне экрана настроек.
+    register(pagePath + '/api/budget', 'GET', async (req, res) => {
+      const token = catalog.tokens.get(state.activeToken)
+      json(res, 200, token === undefined
+        ? { tokenId: '', key: null, user: null, team: null, today: null, error: 'активный токен не выбран', fetchedAt: Date.now() }
+        : await describeBudget(token))
     })
     register(pagePath + '/api/diag', 'GET', async (req, res) => json(res, 200, await describeDiagnostics()))
     register(pagePath + '/api/refresh', 'POST', async (req, res) => {
