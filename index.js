@@ -3848,7 +3848,10 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     /** Число из ответа шлюза либо null: LiteLLM кладёт в поля null, когда лимит не задан. */
     const numOf = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null)
     const pad = (value) => String(value).padStart(2, '0')
-    const dayOf = (date) => date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
+    // Сутки — в UTC, как их считает сам LiteLLM (Prisma DateTime → UTC, date_trunc('day')).
+    // Локальные сутки давали пустой «сегодня» между 00:00 и 03:00 MSK: шлюз ещё живёт вчерашним
+    // UTC-днём, а плагин уже спрашивал новую дату — ноль на экране при живом расходе.
+    const dayOf = (date) => date.getUTCFullYear() + '-' + pad(date.getUTCMonth() + 1) + '-' + pad(date.getUTCDate())
     const today = dayOf(new Date())
     const tomorrowDate = new Date(Date.now() + 86400000)
     const weekStartDate = new Date(Date.now() - 6 * 86400000)
@@ -3948,6 +3951,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         resetAt: String(teamInfo.budget_reset_at || ''),
       },
       today: todaySpend === null ? null : { day: today, spend: todaySpend, models: todayModels, modelsTotal: todayModelsTotal },
+      // Границы суток: шлюз агрегирует по UTC, поэтому и мы — иначе цифры не сходятся с его дашбордом.
+      dayBasis: 'utc',
       week: { days: weekDays, total: weekTotal },
       error: keyAnswer.error || userAnswer.error || teamAnswer.error || spendAnswer.error || '',
       fetchedAt: Date.now(),

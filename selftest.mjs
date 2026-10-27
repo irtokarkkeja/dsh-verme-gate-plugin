@@ -342,7 +342,7 @@ check('деньги: сбор бюджета один на всех (single-flig
 check('деньги: смена ключа сбрасывает кеш прошлого аккаунта', source.includes('invalidateBudget()'))
 check('деньги: карточка и чип тянут /api/budget сами, состояние даёт только кеш',
   client.includes('function useBudgetFeed')
-  && client.includes('useBudgetFeed({ initial: props.initial })')
+  && client.includes('useBudgetFeed({ initial: props.initial, live: true })')
   && client.includes('useBudgetFeed({ live: true })')
   && client.includes('h(BudgetCard, { initial: data.budget })'))
 
@@ -397,6 +397,17 @@ check('релиз одной командой: scripts/release.mjs есть и �
   manifest.scripts.release === 'node scripts/release.mjs'
   && (await readFile(new URL('scripts/release.mjs', here), 'utf8')).includes("const tag = 'v' + next"))
 
+check('деньги: сутки считаются в UTC, как агрегирует шлюз (иначе «сегодня» пусто с 00:00 до 03:00 MSK)',
+  source.includes('date.getUTCFullYear()')
+  && source.includes("dayBasis: 'utc',")
+  && !source.includes('date.getFullYear() + \'-\''))
+check('деньги: карточка показывает, на какое время данные, и не замирает открытой',
+  client.includes("' Данные на ' + new Date(budget.fetchedAt).toLocaleTimeString('ru-RU')")
+  && client.includes('Сутки — в UTC, как их считает шлюз LiteLLM'))
+check('каталог сужается только для своего маршрута: чужие провайдеры не трогаются',
+  source.includes('if (!modelState.known || providerId !== modelState.provider) return models')
+  && source.includes('const installModelGate = () =>')
+  && source.includes('llm.registerAdapter([providerId], route.adapter)'))
 check('проверка обновлений: маршрут /api/update, кеш и сравнение с тегами публикации',
   source.includes("register(pagePath + '/api/update', 'GET'")
   && source.includes('const collectUpdate = async () =>')
