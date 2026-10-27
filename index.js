@@ -301,6 +301,23 @@ export const Config = z.object({
   /** Вывод, объявляемый такой модели (просьба к модели, не резерв порога). */
   defaultMaxTokens: z.number().step(1).default(32768),
   /**
+   * Дефолтный уровень размышлений маршрута («thinking»). Применяется, когда агент/сессия не задал
+   * свой: dsh-llm-pi-ai берёт его из профиля маршрута (streamWithSnapshot: options.reasoningEffort
+   * ?? profile.reasoning). Раньше был жёстко 'low' — при молчащем профиле агента это давало
+   * «у всех low». 'off' на этом шлюзе = минимальный уровень, а не отключение (карта THINKING_LEVEL_MAP).
+   */
+  defaultReasoningEffort: z.union(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']).default('medium'),
+  /**
+   * Переписывать конфиг DSH (saveSelection), когда выбранной модели больше нет в правах ключа.
+   * По умолчанию false: плагин подставляет модель только в памяти и пишет об этом в журнал/панель.
+   */
+  persistDefaultModelSwap: z.boolean().default(false),
+  /**
+   * Переставлять модель у ЖИВЫХ агентов при потере модели. По умолчанию false: подмена идёт
+   * только для новых сессий (дефолт), а начатая работа не меняет модель посреди диалога.
+   */
+  reselectAgentsOnModelLoss: z.boolean().default(false),
+  /**
    * Потолок объявленного вывода (maxTokens), токенов; 0 — не ограничивать.
    * Шлюз иногда отдаёт вывод размером с пол-окна (opus: 200000/64000), а DSH вычитает объявленный
    * вывод из окна целиком: порог автокомпакта = min(0.8·окно, окно − вывод − headroom),
@@ -739,6 +756,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     fetchedAt: 0,
     baseUrl: '',
     provider: '',
+    /** Последняя подмена дефолтной модели: { at, from, to, persisted } — показывается в панели. */
+    defaultSwap: null,
   }
 
   const gatewayBase = () => String(cfg.gatewayBaseUrl || '').replace(/\/+$/, '')
@@ -2212,6 +2231,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         baseUrl: llmBaseUrl(),
         defaultContextWindow: cfg.defaultContextWindow,
         defaultMaxTokens: cfg.defaultMaxTokens,
+        reasoning: cfg.defaultReasoningEffort,
         /**
          * Ключ активного токена на один вызов (пустая строка — ключа нет).
          * @returns {Promise<string>} значение ключа из credential-store.
@@ -2322,7 +2342,16 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     return changed
   }
 
-  /** Если текущая модель вне прав нового ключа — поставить доступную. */
+  /**
+   * Если текущая модель вне прав нового ключа — поставить доступную.
+   *
+   * Решение (ревью хрупких мест): подмена ОСТАЁТСЯ (иначе сессия просто умирает на 403), но
+   * перестала быть молчаливой и перестала трогать чужое:
+   *   • конфиг пользователя (saveSelection) пишем только при persistDefaultModelSwap=true;
+   *   • живых агентов переставляем только при reselectAgentsOnModelLoss=true (по умолчанию нет:
+   *     подмена модели посреди хода меняет стоимость/поведение уже начатой работы);
+   *   • событие всегда видно: журнал + modelState.defaultSwap в /api/state.
+   */
   const ensureDefaultModel = async () => {
     if (!modelState.known || modelState.provider === '' || modelState.allowed.size === 0) return
     const service = ctx.get('agentDefaultModel')
@@ -2338,22 +2367,31 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       && typeof current.model === 'string' && modelState.allowed.has(current.model)
     if (currentAllowed) {
       installDefaultSubstitute(null)
+      modelState.defaultSwap = null
       return
     }
     const first = [...modelState.allowed][0]
     if (first === undefined) return
+    const from = current ? current.provider + '/' + current.model : 'unset'
+    const to = modelState.provider + '/' + first
     let persisted = false
-    try {
-      await service.saveSelection({ provider: modelState.provider, model: first })
-      persisted = true
-      journal('default model persisted -> ' + modelState.provider + '/' + first)
-    } catch (error) {
-      journal('saveSelection refused (' + messageOf(error) + ') — подмена в памяти')
+    if (cfg.persistDefaultModelSwap === true) {
+      try {
+        await service.saveSelection({ provider: modelState.provider, model: first })
+        persisted = true
+        journal('default model persisted -> ' + to)
+      } catch (error) {
+        journal('saveSelection refused (' + messageOf(error) + ') — подмена в памяти')
+      }
     }
     installDefaultSubstitute(persisted ? null : { provider: modelState.provider, model: first })
-    const changed = reselectLiveAgents(modelState.provider, first)
-    log('info', 'модель вне прав ключа: ' + modelState.provider + '/' + first
-      + ' (было ' + (current ? current.provider + '/' + current.model : 'unset') + '), агентов переставлено: ' + changed)
+    const changed = cfg.reselectAgentsOnModelLoss === true ? reselectLiveAgents(modelState.provider, first) : 0
+    modelState.defaultSwap = { at: Date.now(), from, to, persisted, reassignedAgents: changed }
+    journal('WARN default model unavailable (' + from + ') -> substituted ' + to
+      + ' (persisted=' + String(persisted) + ', agents reassigned=' + changed
+      + '; включи persistDefaultModelSwap/reselectAgentsOnModelLoss, если нужно иначе)')
+    log('warn', 'выбранной модели нет в правах ключа: ' + from + ' → ' + to
+      + ' (конфиг ' + (persisted ? 'обновлён' : 'не тронут') + ', живых агентов переставлено: ' + changed + ')')
   }
 
   /**
@@ -3331,6 +3369,10 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         keyWritable: isOwnRef(modelState.keyRef),
         keyState: modelState.keyState,
         baseUrl: modelState.baseUrl,
+        // Уровень размышлений, который маршрут объявляет при молчащем агенте (новая ручка конфига).
+        reasoningEffort: String(cfg.defaultReasoningEffort || ''),
+        // Последняя вынужденная подмена дефолтной модели (выбранной модели нет в правах ключа).
+        defaultSwap: modelState.defaultSwap,
         allowed: modelState.known ? [...modelState.allowed] : null,
         degraded: modelState.degraded,
         error: modelState.error,
@@ -4111,10 +4153,36 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
   })()
 
   /**
+   * Лёгкое обновление модельной части: ключ → свой ref, каталог → GET /v1/models, дефолтная модель.
+   * НЕ поднимает барьер, не перемонтирует MCP-серверы и не гоняет адаптеры: каталог читается
+   * маршрутом на каждый вызов (getModels), поэтому достаточно обновить modelState.
+   * Раньше авто-обновление шло через полный applyActiveToken и задевало монтирования.
+   * @param {string} reason - метка для журнала.
+   * @returns {Promise<void>} завершение обновления.
+   */
+  const refreshModelCatalog = (reason) => serialise(async () => {
+    const started = Date.now()
+    try {
+      await applyModelAccess(state.activeToken)
+    } catch (error) {
+      journal('ERROR models refresh (' + reason + '): ' + messageOf(error))
+    }
+    try {
+      ctx.emit('llm/adapters-updated')
+    } catch (error) {
+      log('warn', 'emit llm/adapters-updated: ' + messageOf(error))
+    }
+    journal('models refresh (' + reason + ') models=' + (modelState.known ? modelState.allowed.size : 'unknown')
+      + ' ms=' + (Date.now() - started))
+  })
+
+  /**
    * Периодическое перечитывание каталога. Права ключа меняются на шлюзе без нашего участия
    * (админ отозвал модели) — без таймера селектор показывал бы старый набор до следующего
    * события (смена токена, запись ключа, ручное «Обновить», рестарт).
-   * Интервал — cfg.modelRefreshMs (0 выключает); фактическая проверка идёт не чаще TTL.
+   * Интервал — cfg.modelRefreshMs (0 выключает). Тик планируется ПОСЛЕ завершения предыдущего
+   * (цепочка setTimeout), а не глушится проверкой «прошло ли уже N мс»: раньше из-за этой проверки
+   * фактический интервал был вдвое больше объявленного (300000 → 10 минут).
    */
   const startModelRefresh = () => {
     const every = Number(cfg.modelRefreshMs) || 0
@@ -4123,15 +4191,29 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       return
     }
     const period = Math.max(30000, every)
-    const timer = setInterval(() => {
-      if (!modelState.known || state.applyPending) return
-      if (Date.now() - Number(modelState.fetchedAt) < every) return
-      applyActiveToken('auto-refresh').catch((error) => {
-        journal('ERROR models: auto-refresh: ' + messageOf(error))
-      })
-    }, period)
-    ctx.effect(() => () => clearInterval(timer), 'verme-gate.modelRefresh')
-    journal('models: auto-refresh every ' + Math.round(period / 1000) + 's')
+    let timer = null
+    let stopped = false
+    const schedule = () => {
+      if (stopped) return
+      timer = setTimeout(async () => {
+        if (!modelState.known || state.applyPending > 0) {
+          schedule()
+          return
+        }
+        try {
+          await refreshModelCatalog('auto-refresh')
+        } catch (error) {
+          journal('ERROR models: auto-refresh: ' + messageOf(error))
+        }
+        schedule()
+      }, period)
+    }
+    schedule()
+    ctx.effect(() => () => {
+      stopped = true
+      if (timer !== null) clearTimeout(timer)
+    }, 'verme-gate.modelRefresh')
+    journal('models: auto-refresh every ' + Math.round(period / 1000) + 's (light path: каталог без MCP-применения)')
   }
 
   /** Выгрузка плагина (HMR/удаление/остановка процесса): снять гейты, монтирования и вернуть ref'ы. */
