@@ -1,6 +1,6 @@
 {
   "name": "verme-gate",
-  "version": "0.3.19",
+  "version": "0.3.20",
   "private": true,
   "type": "module",
   "description": "verme-gate (ex dsh-mcp-access) — DSH plugin: LiteLLM token = access profile for MCP servers/tools/models, native settings screen",
@@ -15,6 +15,11 @@
   },
   "peerDependencies": {
     "@deepseek-ai/dsh": "^0.2.1-rc.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
   },
   "dsh": {
     "bundle": {

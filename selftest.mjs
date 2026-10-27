@@ -382,7 +382,8 @@ check('снимки: ref провайдера и личные значения �
 const manifest = JSON.parse(await readFile(new URL('package.json', here), 'utf8'))
 check('совместимость объявлена: engines.dsh и peer на @deepseek-ai/dsh — одной линией',
   manifest.engines !== undefined && manifest.engines.dsh === '^0.2.1-rc.2'
-  && manifest.peerDependencies !== undefined && manifest.peerDependencies['@deepseek-ai/dsh'] === '^0.2.1-rc.2')
+  && manifest.peerDependencies !== undefined && manifest.peerDependencies['@deepseek-ai/dsh'] === '^0.2.1-rc.2'
+  && manifest.peerDependenciesMeta !== undefined && manifest.peerDependenciesMeta['@deepseek-ai/dsh'].optional === true)
 check('механика версии: чтение версии DSH, сверка диапазона, гейт гост-пакетов',
   source.includes('const dshRuntime = detectDshRuntime()')
   && source.includes('const dshCompat = checkDshCompat(dshRuntime.version, DSH_TESTED_RANGE)')
