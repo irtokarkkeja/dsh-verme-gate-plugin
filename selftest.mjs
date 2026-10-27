@@ -5,6 +5,7 @@
  * Запуск: node selftest.mjs  (или npm test в каталоге плагина)
  */
 import { readFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 const here = new URL('./', import.meta.url)
@@ -498,6 +499,9 @@ try {
     new URL('test/credentials-emergency.test.mjs', here).pathname,
     new URL('test/credentials-race.test.mjs', here).pathname,
   ]
+  const missing = testFiles.filter((path) => !existsSync(path))
+  if (missing.length > 0) throw new Error('тесты не приехали в пакет: ' + missing.join(', ')
+    + ' — проверь "files" в package.json и EXCLUDE в scripts/pack.mjs')
   const output = execFileSync(process.execPath, ['--test', ...testFiles], { encoding: 'utf8' })
   unitTestsOk = /# fail 0|fail 0/.test(output)
   unitTestsDetail = output.split('\n').filter((line) => line.startsWith('# fail') || line.startsWith('# pass')).join(' ')
