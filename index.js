@@ -3325,29 +3325,48 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     const teamInfo = teamAnswer.body !== undefined && teamAnswer.body !== null && teamAnswer.body.team_info
       ? teamAnswer.body.team_info
       : null
-    // Расход за сегодня: тот же /spend/logs, но с датами — шлюз отдаёт дневную сводку вместо строк лога.
+    // Расход по дням: тот же /spend/logs, но с датами — шлюз отдаёт дневную сводку вместо строк лога.
     const pad = (value) => String(value).padStart(2, '0')
     const dayOf = (date) => date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
     const today = dayOf(new Date())
     const tomorrowDate = new Date(Date.now() + 86400000)
-    const spendAnswer = await gatewayGet('/spend/logs?start_date=' + today + '&end_date=' + dayOf(tomorrowDate), key)
+    const weekStartDate = new Date(Date.now() - 6 * 86400000)
+    const spendAnswer = await gatewayGet(
+      '/spend/logs?start_date=' + dayOf(weekStartDate) + '&end_date=' + dayOf(tomorrowDate),
+      key
+    )
+    const spendByDay = new Map()
+    if (Array.isArray(spendAnswer.body)) {
+      for (const entry of spendAnswer.body) {
+        if (entry === null || entry === undefined) continue
+        spendByDay.set(String(entry.startTime || ''), numOf(entry.spend))
+      }
+    }
+    // Неделя всегда ровно семь точек (нули включительно) — клиенту нечем ошибиться в столбиках.
+    const weekDays = []
+    for (let back = 6; back >= 0; back -= 1) {
+      const day = dayOf(new Date(Date.now() - back * 86400000))
+      const value = spendByDay.get(day)
+      weekDays.push({ day: day, spend: value === undefined ? null : value })
+    }
+    const weekTotal = weekDays.reduce((sum, entry) => sum + (entry.spend === null ? 0 : entry.spend), 0)
+    const todayRow = Array.isArray(spendAnswer.body)
+      ? spendAnswer.body.find((entry) => entry !== null && entry !== undefined && String(entry.startTime || '') === today)
+      : undefined
     let todaySpend = null
     let todayModels = []
     let todayModelsTotal = 0
-    if (Array.isArray(spendAnswer.body)) {
-      const row = spendAnswer.body.find((entry) => entry !== null && entry !== undefined && String(entry.startTime || '') === today)
-      if (row !== undefined && row !== null) {
-        todaySpend = numOf(row.spend)
-        const models = row.models !== null && row.models !== undefined && typeof row.models === 'object' ? row.models : {}
-        const allModels = Object.keys(models)
-          .map((name) => ({ model: name, spend: numOf(models[name]) || 0 }))
-          .sort((left, right) => right.spend - left.spend)
-        // Шлём запасом: обрезка до шести строк — на клиенте, чтобы менять вид без правки хоста.
-        todayModels = allModels.slice(0, 24)
-        todayModelsTotal = allModels.length
-      } else if (spendAnswer.body.length > 0) {
-        todaySpend = 0
-      }
+    if (todayRow !== undefined && todayRow !== null) {
+      todaySpend = numOf(todayRow.spend)
+      const models = todayRow.models !== null && todayRow.models !== undefined && typeof todayRow.models === 'object' ? todayRow.models : {}
+      const allModels = Object.keys(models)
+        .map((name) => ({ model: name, spend: numOf(models[name]) || 0 }))
+        .sort((left, right) => right.spend - left.spend)
+      // Шлём запасом: обрезка списка — на клиенте, чтобы менять вид без правки хоста.
+      todayModels = allModels.slice(0, 24)
+      todayModelsTotal = allModels.length
+    } else if (Array.isArray(spendAnswer.body) && spendAnswer.body.length > 0) {
+      todaySpend = 0
     }
     const data = {
       tokenId: token.id,
@@ -3388,6 +3407,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         resetAt: String(teamInfo.budget_reset_at || ''),
       },
       today: todaySpend === null ? null : { day: today, spend: todaySpend, models: todayModels, modelsTotal: todayModelsTotal },
+      week: { days: weekDays, total: weekTotal },
       error: keyAnswer.error || userAnswer.error || teamAnswer.error || spendAnswer.error || '',
       fetchedAt: Date.now(),
     }

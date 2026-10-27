@@ -114,11 +114,35 @@ const STYLE = [
 '.dshBudgetTipHead{font-weight:600;color:var(--dsw-alias-label-primary)}',
 '.dshBudgetTipRow{display:flex;justify-content:space-between;gap:14px}',
 '.dshBudgetTipValue{color:var(--dsw-alias-label-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}',
-'.dshMcpSpend{display:flex;flex-direction:column;gap:2px;margin-top:6px;max-height:132px;overflow:auto}',
-'.dshMcpSpendRow{display:flex;justify-content:space-between;gap:12px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}',
-'.dshMcpSpendName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-'.dshMcpSpendValue{flex-shrink:0;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums}',
-'.dshMcpSpendMore{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}',
+// Карточка денег: герой с остатком, плитки, столбики по дням, таблица моделей.
+'.dshMoneyHero{display:flex;flex-direction:column;gap:10px;padding:14px 16px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md)}',
+'.dshMoneyHeroTop{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}',
+'.dshMoneyLabel{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}',
+'.dshMoneyValue{font-size:24px;line-height:30px;font-weight:600;font-variant-numeric:tabular-nums}',
+'.dshMoneySpent{font-size:16px;line-height:22px;font-weight:600;font-variant-numeric:tabular-nums}',
+'.dshMoneyRight{text-align:right}',
+'.dshMoneySub{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}',
+'.dshMoneyBar{height:6px}',
+'.dshMoneyTiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:12px}',
+'.dshMoneyTile{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-md);min-width:0}',
+'.dshMoneyTileLabel{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}',
+'.dshMoneyTileValue{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+'.dshMoneySection{display:flex;flex-direction:column;gap:8px;margin-top:16px}',
+'.dshMoneySectionHead{display:flex;align-items:baseline;justify-content:space-between;gap:12px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}',
+'.dshMoneySectionMeta{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}',
+'.dshMoneyDays{display:flex;align-items:flex-end;gap:6px;height:64px}',
+'.dshMoneyDay{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px;height:100%;min-width:0}',
+'.dshMoneyDayBar{width:100%;max-width:26px;border-radius:3px 3px 0 0;background:var(--dsw-alias-state-info-primary);min-height:2px}',
+'.dshMoneyDayBar--muted{background:var(--dsw-alias-border-l2)}',
+'.dshMoneyDayLabel{font-size:10px;line-height:14px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}',
+'.dshMoneyTable{display:flex;flex-direction:column;gap:6px}',
+'.dshMoneyRow{display:grid;grid-template-columns:minmax(0,1fr) 96px 64px;align-items:center;gap:10px;font-size:12px;line-height:18px}',
+'.dshMoneyRowName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary)}',
+'.dshMoneyRowShare{display:block;height:4px;border-radius:999px;background:var(--dsw-alias-border-l2);overflow:hidden}',
+'.dshMoneyRowShareFill{display:block;height:100%;border-radius:999px;background:var(--dsw-alias-state-info-primary)}',
+'.dshMoneyRowValue{text-align:right;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary)}',
+'.dshMoneyToggle{align-self:flex-start;border:0;background:none;padding:0;font-family:inherit;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);cursor:pointer;text-decoration:underline;text-underline-offset:2px}',
+'.dshMoneyToggle:hover{color:var(--dsw-alias-label-primary)}',
 '.dshBudgetTipFoot{margin:2px 0 0;color:var(--dsw-alias-label-tertiary)}',
   '.dshMcpChecks{display:flex;flex-direction:column;gap:6px;margin:0 0 4px;max-height:220px;overflow:auto}',
   '.dshMcpBlock{margin:0 0 12px;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm)}',
@@ -143,6 +167,12 @@ const STYLE = [
 function shortModel(name) {
   const parts = String(name).split('/')
   return parts[parts.length - 1]
+}
+
+/** Деньги в сводке по дням: 2026-10-27 → 27.10. */
+function shortDay(day) {
+  const parts = String(day).split('-')
+  return parts.length === 3 ? parts[2] + '.' + parts[1] : String(day)
 }
 
 function callApi(method, path, body) {
@@ -847,11 +877,13 @@ function spendTone(spend, maxBudget) {
  * @returns {object} карточка.
  */
 function BudgetCard(props) {
+  const [expandModels, setExpandModels] = useState(false)
   const budget = props.budget !== null && props.budget !== undefined ? props.budget : {}
   const key = budget.key !== null && budget.key !== undefined ? budget.key : null
   const user = budget.user !== null && budget.user !== undefined ? budget.user : null
   const team = budget.team !== null && budget.team !== undefined ? budget.team : null
   const today = budget.today !== null && budget.today !== undefined ? budget.today : null
+  const week = budget.week !== null && budget.week !== undefined ? budget.week : null
   const error = String(budget.error || '')
   if (key === null && user === null) {
     return h('div', { className: 'dshMcpCard' },
@@ -869,61 +901,91 @@ function BudgetCard(props) {
   const ownerWindow = user === null || user.budgetDuration === '' ? '' : ' за ' + user.budgetDuration
   const resetAt = user === null ? '' : resetOf(user.resetAt)
   const models = today === null || !Array.isArray(today.models) ? [] : today.models
-  // Сколько моделей осталось за кадром: сервер отдаёт запасом, показываем первые шесть.
-  const hiddenModels = today === null || typeof today.modelsTotal !== 'number'
-    ? Math.max(0, models.length - 6)
-    : Math.max(0, today.modelsTotal - Math.min(models.length, 6))
+  const modelsTotal = today !== null && typeof today.modelsTotal === 'number' ? today.modelsTotal : models.length
+  const shownModels = expandModels ? models : models.slice(0, 6)
+  const hiddenModels = Math.max(0, modelsTotal - shownModels.length)
+  const dayTop = models.length > 0 ? Math.max(models[0].spend, 0.000001) : 1
+  const weekDays = week !== null && Array.isArray(week.days) ? week.days : []
+  const weekValues = weekDays.map((entry) => (entry.spend === null ? 0 : entry.spend))
+  const weekTop = weekValues.length > 0 ? Math.max.apply(null, weekValues.concat([0.000001])) : 1
+  const tile = (label, value, title) => h('div', { className: 'dshMoneyTile' },
+    h('span', { className: 'dshMoneyTileLabel' }, label),
+    h('span', { className: 'dshMoneyTileValue', title: title === undefined ? value : title }, value))
   return h('div', { className: 'dshMcpCard' },
     h('div', { className: 'dshMcpCardHead' },
       h('div', null,
         h('h3', { className: 'dshMcpCardTitle' }, 'Деньги: сколько осталось'),
         h('p', { className: 'dshMcpCardNote' }, 'Считает шлюз LiteLLM. Лимит стоит на аккаунте, а не на этом DSH: его делят все ключи аккаунта.'))),
-    h('div', { className: 'dshMcpRow' },
-      h('div', { className: 'dshMcpRowMain' },
-        h('span', { className: 'dshMcpRowTitle' },
-          ownerLimit === null
-            ? 'Потрачено ' + moneyOf(ownerSpend)
-            : 'Осталось ' + moneyOf(ownerLeft) + ' из ' + moneyOf(ownerLimit)),
-        h('span', { className: 'dshMcpRowMeta' },
-          ownerLimit === null
+    h('div', { className: 'dshMoneyHero' },
+      h('div', { className: 'dshMoneyHeroTop' },
+        h('div', null,
+          h('div', { className: 'dshMoneyLabel' }, ownerLimit === null ? 'Потрачено' : 'Осталось'),
+          h('div', { className: 'dshMoneyValue' }, moneyOf(ownerLimit === null ? ownerSpend : ownerLeft)),
+          h('div', { className: 'dshMoneySub' }, ownerLimit === null
             ? 'лимита у аккаунта нет'
-            : 'израсходовано ' + moneyOf(ownerSpend) + ownerWindow + (resetAt === '' ? '' : ' · сброс ' + resetAt)),
-        h('div', { className: 'dshMcpBar' },
-          h('div', {
-            className: 'dshMcpBarFill' + (ownerTone === '' ? '' : ' dshMcpBarFill--' + ownerTone),
-            style: { width: String(ownerRatio) + '%' },
-          })))),
-    today === null ? null : h('div', { className: 'dshMcpRow' },
-      h('div', { className: 'dshMcpRowMain' },
-        h('span', { className: 'dshMcpRowTitle' }, 'Сегодня — ' + moneyOf(today.spend)),
-        models.length === 0
-          ? h('span', { className: 'dshMcpRowMeta' }, 'расхода не было')
-          : h('div', { className: 'dshMcpSpend' },
-            models.slice(0, 6).map((entry) => h('div', { className: 'dshMcpSpendRow', key: entry.model },
-              h('span', { className: 'dshMcpSpendName', title: entry.model }, shortModel(entry.model)),
-              h('span', { className: 'dshMcpSpendValue' }, moneyOf(entry.spend)))),
-            hiddenModels > 0 ? h('div', { className: 'dshMcpSpendMore' }, 'и ещё ' + String(hiddenModels) + ' модел' + (hiddenModels === 1 ? 'ь' : 'ей')) : null))),
-    key === null ? null : h('div', { className: 'dshMcpRow' },
-      h('div', { className: 'dshMcpRowMain' },
-        h('span', { className: 'dshMcpRowTitle' }, 'Ключ «' + (key.alias !== '' ? key.alias : key.name) + '»'),
-        h('span', { className: 'dshMcpRowMeta' },
-          'за всё время ' + moneyOf(key.spend)
-          + (key.maxBudget === null ? ' · лимита на ключе нет' : ' · лимит ключа ' + moneyOf(key.maxBudget))
-          + (key.models > 0 ? ' · моделей ' + String(key.models) : '')))),
-    team === null ? null : h('div', { className: 'dshMcpRow' },
-      h('div', { className: 'dshMcpRowMain' },
-        h('span', { className: 'dshMcpRowTitle' },
-          'Группа ' + (team.alias !== '' ? team.alias : team.id) + (team.adfsGroup !== '' ? ' (ADFS)' : '')),
-        h('span', { className: 'dshMcpRowMeta' },
-          (team.members > 0 ? String(team.members) + ' участника' : 'состав неизвестен')
-          + ' · расход группы ' + moneyOf(team.spend)
-          + (team.maxBudget === null ? ' · лимита у группы нет' : ' · лимит ' + moneyOf(team.maxBudget))))),
+            : 'из ' + moneyOf(ownerLimit) + ownerWindow + (resetAt === '' ? '' : ' · сброс ' + resetAt))),
+        h('div', { className: 'dshMoneyRight' },
+          h('div', { className: 'dshMoneyLabel' }, 'Израсходовано'),
+          h('div', { className: 'dshMoneySpent' }, moneyOf(ownerSpend)),
+          ownerLimit === null ? null : h('div', { className: 'dshMoneySub' }, String(ownerRatio) + '% лимита'))),
+      ownerLimit === null ? null : h('div', { className: 'dshMcpBar dshMoneyBar' },
+        h('div', {
+          className: 'dshMcpBarFill' + (ownerTone === '' ? '' : ' dshMcpBarFill--' + ownerTone),
+          style: { width: String(ownerRatio) + '%' },
+        }))),
+    h('div', { className: 'dshMoneyTiles' },
+      tile('Лимит', ownerLimit === null ? 'не задан' : moneyOf(ownerLimit) + ownerWindow),
+      tile('Сброс окна', resetAt === '' ? '—' : resetAt, user === null ? '' : user.resetAt),
+      tile('Сегодня', today === null ? '—' : moneyOf(today.spend)),
+      tile('За 7 дней', week === null ? '—' : moneyOf(week.total)),
+      key === null ? null : tile('Ключ «' + (key.alias !== '' ? key.alias : key.name) + '»',
+        moneyOf(key.spend) + ' за всё время',
+        key.maxBudget === null ? 'лимита на ключе нет' : 'лимит ключа ' + moneyOf(key.maxBudget)),
+      team === null ? null : tile('Группа' + (team.adfsGroup !== '' ? ' (ADFS)' : ''),
+        (team.alias !== '' ? team.alias : team.id) + (team.members > 0 ? ' · ' + String(team.members) + ' чел.' : ''),
+        'расход группы ' + moneyOf(team.spend) + (team.maxBudget === null ? ', лимита нет' : ', лимит ' + moneyOf(team.maxBudget)))),
+    weekDays.length === 0 ? null : h('div', { className: 'dshMoneySection' },
+      h('div', { className: 'dshMoneySectionHead' },
+        h('span', null, 'Расход по дням'),
+        h('span', { className: 'dshMoneySectionMeta' }, 'за неделю ' + moneyOf(week.total))),
+      h('div', { className: 'dshMoneyDays' }, weekDays.map((entry) => h('div', {
+        className: 'dshMoneyDay',
+        key: entry.day,
+        title: entry.day + ': ' + (entry.spend === null ? 'нет данных' : moneyOf(entry.spend)),
+      },
+      h('div', {
+        className: 'dshMoneyDayBar' + (entry.spend === null || entry.spend <= 0 ? ' dshMoneyDayBar--muted' : ''),
+        style: { height: String(Math.max(2, Math.round(((entry.spend === null ? 0 : entry.spend) / weekTop) * 100))) + '%' },
+      }),
+      h('div', { className: 'dshMoneyDayLabel' }, shortDay(entry.day)))))),
+    h('div', { className: 'dshMoneySection' },
+      h('div', { className: 'dshMoneySectionHead' },
+        h('span', null, 'Сегодня по моделям'),
+        h('span', { className: 'dshMoneySectionMeta' },
+          today === null ? '' : moneyOf(today.spend) + (modelsTotal > 0 ? ' · моделей ' + String(modelsTotal) : ''))),
+      today === null || models.length === 0
+        ? h('p', { className: 'dshMcpFoot' }, 'Сегодня расхода ещё не было.')
+        : h('div', { className: 'dshMoneyTable' },
+          shownModels.map((entry) => h('div', { className: 'dshMoneyRow', key: entry.model },
+            h('span', { className: 'dshMoneyRowName', title: entry.model }, shortModel(entry.model)),
+            h('span', { className: 'dshMoneyRowShare' },
+              h('span', {
+                className: 'dshMoneyRowShareFill',
+                style: { width: String(Math.max(2, Math.round((entry.spend / dayTop) * 100))) + '%' },
+              })),
+            h('span', { className: 'dshMoneyRowValue' }, moneyOf(entry.spend)))),
+          hiddenModels > 0 || expandModels
+            ? h('button', {
+              type: 'button',
+              className: 'dshMoneyToggle',
+              onClick: () => setExpandModels(!expandModels),
+            }, expandModels ? 'свернуть' : 'показать все (' + String(modelsTotal) + ')')
+            : null)),
     error === '' ? null : h(Notice, { text: 'Часть ответа шлюза недоступна: ' + error, tone: 'warn' }),
     h('p', { className: 'dshMcpFoot' },
       'Источники: /key/info, /user/info, /team/info, /spend/logs шлюза. Расход обновляется с задержкой ~10 с; '
       + 'для моделей без тарифа в шлюзе сумма занижена.'))
 }
-
 /**
  * Чип бюджета под композером: «$4.44 / $10.00» и полоска расхода; подробности — по наведению.
  * Данные тянет сам (маршрут /api/budget), потому что слот композера не получает state экрана.
