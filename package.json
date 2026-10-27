@@ -1,0 +1,36 @@
+{
+  "name": "verme-gate",
+  "version": "0.3.5",
+  "private": true,
+  "type": "module",
+  "description": "verme-gate (ex dsh-mcp-access) — DSH plugin: LiteLLM token = access profile for MCP servers/tools/models, native settings screen",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "external": []
+    }
+  },
+  "scripts": {
+    "build:client": "node scripts/build-client.mjs",
+    "selftest": "node selftest.mjs"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "client",
+    "scripts",
+    "page.html",
+    "README.md",
+    "selftest.mjs",
+    "cordis.patch.yml"
+  ]
+}

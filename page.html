@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dsh-mcp-access — токены доступа</title>
+<style>
+  :root { color-scheme: dark; --bg:#16181d; --panel:#1e2128; --line:#2c313b; --fg:#e6e8ee; --dim:#98a0b0;
+          --ok:#3fb950; --warn:#d29922; --bad:#f85149; --acc:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--fg);
+         font:14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h2 { font-size:15px; margin:24px 0 8px; color:var(--fg); }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:16px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }
+  code, .mono { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+  code { background:#12141a; padding:1px 5px; border-radius:5px; }
+  a { color:var(--acc); }
+  input[type=password], input[type=text] { background:#12141a; border:1px solid var(--line); color:var(--fg);
+         border-radius:6px; padding:6px 8px; font-size:13px; width:200px; }
+  button { background:#262b34; color:var(--fg); border:1px solid var(--line); border-radius:6px;
+           padding:6px 11px; font-size:13px; cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button.primary { background:#1f6feb33; border-color:#1f6feb66; }
+  button:disabled { opacity:.5; cursor:default; }
+  .pill { display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px; font-weight:600; }
+  .s-mounted { background:#3fb95022; color:var(--ok); }
+  .s-no-token { background:#d2992222; color:var(--warn); }
+  .s-no-env { background:#d2992222; color:var(--warn); }
+  .s-starting { background:#58a6ff22; color:var(--acc); }
+  .s-failed { background:#f8514922; color:var(--bad); }
+  .s-not-mounted { background:#98a0b022; color:var(--dim); }
+  .s-key-error { background:#f8514922; color:var(--bad); }
+  .s-token-rejected { background:#f8514922; color:var(--bad); }
+  #banner:empty { display:none; }
+  #banner { border:1px solid var(--bad); background:#f8514911; border-radius:8px; padding:8px 10px;
+            margin:10px 0 0; font-size:12px; }
+  #banner .b-item { margin:2px 0; }
+  #banner .b-warn { color:var(--warn); }
+  #banner .b-bad { color:var(--bad); }
+  .mode { font-size:11px; padding:1px 6px; border-radius:5px; border:1px solid var(--line); color:var(--dim); }
+  .g { color:var(--dim); }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+  .tabs { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  .tabs button.active { border-color:var(--acc); background:#1f6feb33; }
+  #msg { min-height:18px; font-size:12px; color:var(--dim); }
+  .hint { font-size:12px; color:var(--dim); }
+  .var { font-size:12px; }
+  .var b { font-weight:600; }
+</style>
+</head>
+<body>
+<h1>dsh-mcp-access</h1>
+<div class="sub">Токен доступа = профиль: MCP-серверы и тулзы за шлюзом LiteLLM + модели его ключа.
+Секреты хранятся в credential-store, значение обратно не отдаётся (только «задан / не задан»).</div>
+
+<div class="card">
+  <div class="row">
+    <strong>Активный токен:</strong>
+    <span id="activeLabel" class="mono">…</span>
+    <span class="g" id="activeMeta"></span>
+    <span style="flex:1"></span>
+    <button id="refresh">Обновить</button>
+  </div>
+  <div class="tabs" id="tokenTabs"></div>
+  <div class="hint" id="gatewayMeta"></div>
+  <div id="banner"></div>
+  <div id="msg"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">MCP-серверы за шлюзом</h2>
+  <div class="hint">Список — из реестра шлюза ключом активного токена (<span class="mono">GET /v1/mcp/server</span>):
+  шлюз отдаёт только разрешённые ключу серверы. Каждый смонтированный сервер = строка
+  <span class="mono">dsh-mcp-client</span>, <span class="mono">streamable-http</span>, url
+  <span class="mono">&lt;gateway&gt;/&lt;server&gt;/mcp</span>, заголовок
+  <span class="mono">Authorization: Bearer &lt;ключ токена&gt;</span>.</div>
+  <table>
+    <thead><tr><th>Сервер</th><th>Креды</th><th>Грант / allowlist</th><th>Статус</th></tr></thead>
+    <tbody id="servers"></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Токены доступа и их ключи</h2>
+  <div class="hint">Токен доступа = LiteLLM-ключ: права на MCP-серверы и модели определяет шлюз (чужой сервер →
+  пустой <span class="mono">tools/list</span>, чужая модель → 403). Каталог моделей = ответ
+  <span class="mono">GET /v1/models</span> этим ключом. Поле write-only. «*» — сервер открыт целиком,
+  иначе точечный allowlist raw-имён тулзов шлюза.</div>
+  <table>
+    <thead><tr><th>Токен</th><th>Серверы / тулзы</th><th>LiteLLM-ключ</th><th>Активен</th></tr></thead>
+    <tbody id="grants"></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Модели под активным токеном</h2>
+  <div class="hint">Источник правды — ключ активного токена: список получен запросом
+  <span class="mono">GET /v1/models</span> и реально отдаётся каталогом
+  <span class="mono">session/modelCatalog</span>. Модель вне списка шлюз отклонит (403), поэтому при
+  переключении токена модель по умолчанию автоматически переставляется на доступную.</div>
+  <div id="models" class="mono" style="white-space:pre-wrap"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Диагностика гейтов (живой реестр)</h2>
+  <div class="hint">visibleMcp у каждого живого агента — то, что реально отдаётся агенту из
+  <span class="mono">ctx.tools.schemas(scope)</span>. Модели — из <span class="mono">ctx.llm.listProviders()</span>
+  (тот же путь, что <span class="mono">session/modelCatalog</span>).</div>
+  <div id="diag" class="mono" style="white-space:pre-wrap;margin-top:8px"></div>
+</div>
+
+<script>
+const base = location.pathname.replace(/\/+$/, '');
+let state = null;
+
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>"]/g, function (ch) {
+    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch];
+  });
+}
+function msg(text, bad) {
+  const el = document.getElementById('msg');
+  el.innerHTML = text ? '<span class="' + (bad ? 'bad' : 'ok') + '">' + esc(text) + '</span>' : '';
+}
+async function api(path, options) {
+  const response = await fetch(base + path, Object.assign({ headers: { 'content-type': 'application/json' } }, options || {}));
+  const text = await response.text();
+  let value;
+  try { value = text ? JSON.parse(text) : {} } catch (e) { value = { error: text }; }
+  if (!response.ok) throw new Error((value && value.error) || ('HTTP ' + response.status));
+  return value;
+}
+function pill(status) {
+  const label = status === 'mounted' ? 'смонтирован' : status === 'no-token' ? 'нет токена'
+    : status === 'no-env' ? 'нет серверных кредов' : status === 'starting' ? 'стартует'
+    : status === 'failed' ? 'ошибка' : status === 'key-error' ? 'ключ не работает'
+    : status === 'token-rejected' ? 'токен не принят' : 'не смонтирован';
+  return '<span class="pill s-' + esc(status) + '">' + esc(label) + '</span>';
+}
+function credsCell(server) {
+  const parts = [];
+  if (server.mode === 'header') {
+    parts.push('<div class="mono g">' + esc(server.tokenHeader) + ' → credential-store</div>');
+    parts.push(server.tokenConfigured
+      ? '<div class="ok">личный ключ задан</div>'
+      : '<div class="warn">личный ключ не задан</div>');
+    parts.push('<div class="mono g">ref: ' + esc(server.tokenRef) + '</div>');
+    // живость токена (verifyTool): зелёный статус только после успешной проверки
+    if (server.tokenStatus === 'token-ok') {
+      parts.push('<div class="ok">токен принят (HTTP ' + esc(server.tokenHttpCode)
+        + (server.tokenLogin ? ', ' + esc(server.tokenLogin) : '') + ')</div>');
+    } else if (server.tokenStatus === 'token-rejected') {
+      parts.push('<div class="bad">токен НЕ принят: ' + esc(server.tokenReason || ('HTTP ' + server.tokenHttpCode))
+        + ' — тулзы сервера запрещены агентам</div>');
+    } else if (server.tokenStatus === 'token-unknown') {
+      parts.push('<div class="warn">живость токена не проверена: ' + esc(server.tokenReason || '—') + '</div>');
+    }
+    if (server.verifyTool) {
+      parts.push('<button data-action="verify" data-server="' + esc(server.name) + '">Проверить токен</button>');
+    }
+    parts.push('<div class="row" style="margin-top:6px">'
+      + '<input type="password" id="tok-' + esc(server.name) + '" placeholder="введите токен" autocomplete="new-password">'
+      + '<button data-action="save" data-server="' + esc(server.name) + '">Сохранить</button>'
+      + '<button data-action="clear" data-server="' + esc(server.name) + '">Снять</button>'
+      + '</div>');
+    return parts.join('');
+  }
+  if (server.mode === 'gateway') {
+    parts.push('<div class="mono g">серверные креды живут в шлюзе</div>');
+    if (!server.envRequired.length) parts.push('<div class="g">env-переменных не требуется</div>');
+    server.envRequired.forEach(function (item) {
+      parts.push('<div class="var">' + (item.isSet ? '<span class="ok">● задан</span>' : '<span class="warn">○ не задан</span>')
+        + ' <b>' + esc(item.name) + '</b><br><span class="g">' + esc(item.description) + '</span></div>');
+    });
+    if (server.missingCount > 0) {
+      parts.push('<div class="warn">не хватает: ' + esc(server.missingCount) + '</div>');
+    }
+    if (server.setupUrl) {
+      parts.push('<a href="' + esc(server.setupUrl) + '" target="_blank" rel="noopener">проставить в UI шлюза →</a>');
+    }
+    return parts.join('');
+  }
+  parts.push('<div class="g">креды не требуются</div>');
+  return parts.join('');
+}
+function banner() {
+  const items = [];
+  (state.configErrors || []).forEach(function (e) { items.push('<div class="b-item b-bad">ошибка конфига: ' + esc(e) + '</div>'); });
+  (state.configWarnings || []).forEach(function (e) { items.push('<div class="b-item b-warn">предупреждение: ' + esc(e) + '</div>'); });
+  (state.registryWarnings || []).forEach(function (e) { items.push('<div class="b-item b-warn">' + esc(e) + '</div>'); });
+  if (state.phase === 'switching' || state.barrier) {
+    items.push('<div class="b-item b-warn">применение токена в работе: MCP-тулзы временно запрещены всем агентам (fail-closed)</div>');
+  }
+  const models = state.models || {};
+  if (models.keyState === 'config-invalid') items.push('<div class="b-item b-bad">' + esc(models.error) + '</div>');
+  else if (models.keyState === 'error' || models.keyState === 'no-key') items.push('<div class="b-item b-warn">модели: ' + esc(models.error) + '</div>');
+  if (models.degraded) items.push('<div class="b-item b-warn">models[] токена не пересекается с правами ключа — каталог развёрнут до прав ключа</div>');
+  if (state.gateway && state.gateway.keyHealthError) items.push('<div class="b-item b-warn">ключ не подтвердился на /v1/models: ' + esc(state.gateway.keyHealthError) + ' (монтирования не выполняются)</div>');
+  (state.snapshotWarnings || []).forEach(function (e) { items.push('<div class="b-item b-warn">снимок ключа: ' + esc(e) + '</div>'); });
+  (state.verify || []).filter(function (v) { return v.status === 'token-rejected'; }).forEach(function (v) {
+    items.push('<div class="b-item b-bad">токен сервера ' + esc(v.server) + ' не принят: '
+      + esc(v.reason || ('HTTP ' + v.httpCode)) + ' — сервер помечен token-rejected, его тулзы запрещены</div>');
+  });
+  const retry = state.retry || {};
+  if (retry.attempts > 0 && retry.nextRetryAt) {
+    items.push('<div class="b-item b-warn">авто-повтор обращения к шлюзу #' + retry.attempts
+      + ' через ' + Math.max(0, Math.round((retry.retryInMs || 0) / 1000)) + ' с'
+      + (retry.lastError ? ': ' + esc(retry.lastError) : '') + ' (ручной /api/refresh сбрасывает таймер)</div>');
+  }
+  if (state.phase === 'degraded' && state.lastError) items.push('<div class="b-item b-bad">деградация: ' + esc(state.lastError) + '</div>');
+  document.getElementById('banner').innerHTML = items.join('');
+}
+function render() {
+  if (!state) return;
+  banner();
+  document.getElementById('activeLabel').textContent = state.activeToken || '(не выбран)';
+  const activeToken = state.tokens.filter(function (t) { return t.active; })[0];
+  document.getElementById('activeMeta').textContent = 'поколение ' + state.generation
+    + ' · серверов в гранте: ' + (activeToken ? activeToken.servers.length : 0)
+    + (state.missingGrants && state.missingGrants.length ? ' · ОШИБКА: неизвестные серверы ' + state.missingGrants.join(',') : '');
+  const gateway = state.gateway || {};
+  document.getElementById('gatewayMeta').innerHTML = 'шлюз: <span class="mono">' + esc(gateway.baseUrl || '—') + '</span>'
+    + ' · серверов в реестре: ' + (gateway.registeredServers || []).length
+    + (gateway.registryError ? ' · <span class="bad">реестр: ' + esc(gateway.registryError) + '</span>' : '');
+  const tabs = document.getElementById('tokenTabs');
+  tabs.innerHTML = '';
+  state.tokens.forEach(function (token) {
+    const button = document.createElement('button');
+    button.textContent = (token.active ? '● ' : '') + token.label;
+    if (token.active) button.className = 'active';
+    button.onclick = function () { switchToken(token.id); };
+    tabs.appendChild(button);
+  });
+  const servers = document.getElementById('servers');
+  servers.innerHTML = state.servers.map(function (server) {
+    const grantText = server.granted
+      ? '<span class="ok">да</span> <span class="mono g">[' + esc((server.toolAllow || []).join(', ')) + ']</span>'
+      : '<span class="g">—</span>';
+    const toolsText = (server.mountedTools || []).length
+      ? '<div class="mono g">тулзов в реестре: ' + server.mountedTools.length + '</div>' : '';
+    return '<tr>'
+      + '<td><strong>' + esc(server.label) + '</strong>'
+      + ' <span class="mode">' + esc(server.name) + '</span><br>'
+      + '<span class="mono g">' + esc(server.serverName) + ' · ' + esc(server.url) + '</span>'
+      + (server.description ? '<div class="g">' + esc(server.description) + '</div>' : '')
+      + (server.accessGroups && server.accessGroups.length ? '<div class="g">группы: ' + esc(server.accessGroups.join(', ')) + '</div>' : '')
+      + (server.registryKnown ? '' : '<div class="g">(нет в реестре ключа)</div>')
+      + '</td>'
+      + '<td>' + credsCell(server) + '</td>'
+      + '<td>' + grantText + toolsText + '</td>'
+      + '<td>' + pill(server.status) + (server.error ? '<br><span class="mono bad">' + esc(server.error) + '</span>' : '') + '</td>'
+      + '</tr>';
+  }).join('');
+  const grants = document.getElementById('grants');
+  grants.innerHTML = state.tokens.map(function (token) {
+    const serverText = token.servers.map(function (grant) {
+      return esc(grant.server) + ' <span class="g">[' + esc(grant.tools.join(', ')) + ']</span>';
+    }).join('<br>') || '<span class="g">—</span>';
+    const keyText = (token.keyConfigured ? '<span class="ok">ключ задан</span>' : '<span class="g">не задан</span>')
+      + '<br><span class="mono g">ref: ' + esc(token.keyRef || '—') + '</span>'
+      + (token.models && token.models.length ? '<br><span class="mono g">models[]: ' + esc(token.models.join(', ')) + '</span>' : '')
+      + '<div class="row" style="margin-top:6px">'
+      + '<input type="password" id="tkey-' + esc(token.id) + '" placeholder="LiteLLM-ключ" autocomplete="new-password">'
+      + '<button data-tokenaction="save" data-token="' + esc(token.id) + '">Сохранить</button>'
+      + '<button data-tokenaction="clear" data-token="' + esc(token.id) + '">Снять</button>'
+      + '</div>';
+    return '<tr><td><strong>' + esc(token.label) + '</strong><br><span class="mono g">' + esc(token.id)
+      + ' · source=' + esc(token.source || 'manual') + (token.group ? ' · group=' + esc(token.group) : '') + '</span></td>'
+      + '<td>' + serverText + '</td><td>' + keyText + '</td><td>'
+      + (token.active ? '<span class="ok">да</span>' : '<span class="g">—</span>') + '</td></tr>';
+  }).join('');
+  grants.querySelectorAll('button[data-tokenaction]').forEach(function (button) {
+    button.onclick = function () {
+      const tokenId = button.getAttribute('data-token');
+      if (button.getAttribute('data-tokenaction') === 'clear') return saveTokenKey(tokenId, '');
+      const input = document.getElementById('tkey-' + tokenId);
+      return saveTokenKey(tokenId, input ? input.value : '');
+    };
+  });
+  const models = state.models || {};
+  const lines = [];
+  lines.push('провайдер: ' + (models.provider || '—') + ' · ключ: ' + (models.keyRef || '—')
+    + ' · состояние: ' + (models.keyState || '—'));
+  lines.push('модель по умолчанию: ' + (models.current ? models.current.provider + '/' + models.current.model : '—'));
+  lines.push('доступно ключом: ' + (models.allowed === null ? 'не ограничено (данных шлюза нет)' : models.allowed.length + ' шт.')
+    + (models.degraded ? ' [models[] токена проигнорирован: пустое пересечение]' : '')
+    + (models.fetchedAt ? ' · снято ' + new Date(models.fetchedAt).toISOString() : ''));
+  if (models.allowed && models.allowed.length) lines.push(models.allowed.map(function (id) { return '  • ' + id; }).join('\n'));
+  if (models.error) lines.push('ошибка: ' + models.error);
+  document.getElementById('models').textContent = lines.join('\n');
+  servers.querySelectorAll('button[data-action]').forEach(function (button) {
+    button.onclick = function () {
+      const server = button.getAttribute('data-server');
+      if (button.getAttribute('data-action') === 'verify') return verifyToken(server);
+      if (button.getAttribute('data-action') === 'clear') return saveSecret(server, '');
+      const input = document.getElementById('tok-' + server);
+      return saveSecret(server, input ? input.value : '');
+    };
+  });
+}
+async function load() {
+  try {
+    state = await api('/api/state');
+    render();
+    const diag = await api('/api/diag');
+    document.getElementById('diag').textContent = JSON.stringify(diag, null, 2);
+  } catch (error) {
+    msg('ошибка загрузки: ' + error.message + (String(error.message).indexOf('401') >= 0 || String(error.message).indexOf('403') >= 0
+      ? ' — нет доступа: откройте страницу из DSH-клиента (нужна авторизованная сессия)' : ''), true);
+  }
+}
+async function saveSecret(server, value) {
+  try {
+    msg('сохраняю токен для ' + server + ' …');
+    state = await api('/api/secret', { method: 'POST', body: JSON.stringify({ server: server, value: value }) });
+    render();
+    msg(value === '' ? 'токен снят для ' + server : 'токен сохранён для ' + server);
+  } catch (error) {
+    msg('не сохранено: ' + error.message, true);
+  }
+}
+async function verifyToken(server) {
+  try {
+    msg('проверяю токен для ' + server + ' …');
+    state = await api('/api/verify', { method: 'POST', body: JSON.stringify({ server: server }) });
+    const result = (state.verify || []).filter(function (item) { return item.server === server; })[0] || {};
+    render();
+    msg(server + ': ' + result.status + (result.login ? ', ' + result.login : '')
+      + (result.reason ? ' — ' + result.reason : ''), result.status === 'token-rejected');
+  } catch (error) {
+    msg('проверка не удалась: ' + error.message, true);
+  }
+}
+async function saveTokenKey(tokenId, value) {
+  try {
+    msg('сохраняю LiteLLM-ключ токена ' + tokenId + ' …');
+    state = await api('/api/token-key', { method: 'POST', body: JSON.stringify({ token: tokenId, value: value }) });
+    render();
+    msg(value === '' ? 'ключ снят у токена ' + tokenId : 'ключ сохранён у токена ' + tokenId);
+  } catch (error) {
+    msg('не сохранено: ' + error.message, true);
+  }
+}
+async function switchToken(tokenId) {
+  try {
+    msg('переключаю активный токен на ' + tokenId + ' …');
+    state = await api('/api/active', { method: 'POST', body: JSON.stringify({ tokenId: tokenId }) });
+    render();
+    msg('активный токен: ' + tokenId + ' (применено без рестарта)');
+  } catch (error) {
+    msg('не переключено: ' + error.message, true);
+  }
+}
+document.getElementById('refresh').onclick = load;
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

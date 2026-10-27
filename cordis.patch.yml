@@ -1,0 +1,19 @@
+# verme-gate — bundle-слой: только строка плагина.
+#
+# Ряд объявляется записью с insert (слой бандла — это patch-слой поверх дерева), name
+# относительный: bare-имя пакета из контекста лоадера не резолвится.
+#
+# Маршрут моделей здесь НЕ объявляется: плагин владеет им сам (createProvider + PiAiAdapter +
+# ctx.llm.registerAdapter, см. lib/gateway-route.js), поэтому каталог в селекторе = права
+# активного ключа и обновляется без пересборки бандла. Объявить llm-pi-ai.providers.<llmProvider>
+# в патче профиля нельзя — два владельца маршрута конфликтуют (REGISTRATION_CONFLICT).
+- insert:
+    - id: verme-gate
+      name: ./index.js
+
+# Модель по умолчанию — из маршрута плагина (id = llmProvider).
+- id: agent-default-model
+  config:
+    provider: dshlab
+    model: deepseek/deepseek-v4-pro
+    reasoningEffort: low
