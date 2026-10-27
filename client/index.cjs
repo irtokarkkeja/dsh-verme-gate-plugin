@@ -98,6 +98,10 @@ const STYLE = [
 '.dshMcpVerdict--warn{color:var(--dsw-alias-state-warn-primary)}',
 '.dshMcpVerdict--bad{color:var(--dsw-alias-state-error-primary)}',
 '.dshMcpFoot{margin:0;font-size:11px;line-height:17px;color:var(--dsw-alias-label-tertiary)}',
+'.dshMcpBar{height:6px;border-radius:3px;background:var(--dsw-alias-border-l1);overflow:hidden;margin:8px 0 0}',
+'.dshMcpBarFill{height:100%;border-radius:3px;background:var(--dsw-alias-state-info-primary);transition:width .2s ease}',
+'.dshMcpBarFill--warn{background:var(--dsw-alias-state-warn-primary)}',
+'.dshMcpBarFill--bad{background:var(--dsw-alias-state-error-primary)}',
   '.dshMcpChecks{display:flex;flex-direction:column;gap:6px;margin:0 0 4px;max-height:220px;overflow:auto}',
   '.dshMcpBlock{margin:0 0 12px;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm)}',
   '.dshMcpBlockHead{margin:0 0 6px;font-size:11px;line-height:16px;font-weight:600;color:var(--dsw-alias-label-secondary)}',
@@ -783,6 +787,94 @@ function SsoDialog(props) {
     h('p', { className: 'dshMcpModalText' }, 'Когда SSO появится, он станет вторым вариантом подключения: либо ключ LiteLLM, либо вход. Сейчас работает ключ.')))
 }
 
+/** Деньги из ответа шлюза: LiteLLM отдаёт доллары числом, null — лимит не задан. */
+function moneyOf(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? '$' + value.toFixed(2) : '—'
+}
+
+/** Остаток по лимиту: null, когда лимита нет или расход неизвестен. */
+function leftOf(spend, maxBudget) {
+  if (typeof spend !== 'number' || typeof maxBudget !== 'number') return null
+  return Math.max(0, maxBudget - spend)
+}
+
+/** Дата сброса окна бюджета в местном времени: «02.11.2026, 03:00». */
+function resetOf(iso) {
+  if (typeof iso !== 'string' || iso === '') return ''
+  const at = new Date(iso)
+  if (Number.isNaN(at.getTime())) return ''
+  const pad = (value) => String(value).padStart(2, '0')
+  return pad(at.getDate()) + '.' + pad(at.getMonth() + 1) + '.' + at.getFullYear()
+    + ', ' + pad(at.getHours()) + ':' + pad(at.getMinutes())
+}
+
+/** Тон полосы расхода: до 70% — обычный, до 90% — жёлтый, дальше красный. */
+function spendTone(spend, maxBudget) {
+  if (typeof spend !== 'number' || typeof maxBudget !== 'number' || maxBudget <= 0) return ''
+  const ratio = spend / maxBudget
+  if (ratio >= 0.9) return 'bad'
+  if (ratio >= 0.7) return 'warn'
+  return ''
+}
+
+/**
+ * Бюджет активного ключа: расход и лимиты из /key/info и /user/info шлюза.
+ * @param {{budget: object|undefined}} props - блок budget из /api/state.
+ * @returns {object} карточка.
+ */
+function BudgetCard(props) {
+  const budget = props.budget !== null && props.budget !== undefined ? props.budget : {}
+  const key = budget.key !== null && budget.key !== undefined ? budget.key : null
+  const user = budget.user !== null && budget.user !== undefined ? budget.user : null
+  const error = String(budget.error || '')
+  if (key === null && user === null) {
+    return h('div', { className: 'dshMcpCard' },
+      h('div', { className: 'dshMcpCardHead' },
+        h('div', null,
+          h('h3', { className: 'dshMcpCardTitle' }, 'Бюджет ключа'),
+          h('p', { className: 'dshMcpCardNote' }, 'Сколько денег осталось у ключа в шлюзе LiteLLM.'))),
+      h(Notice, { text: error === '' ? 'Шлюз не рассказал о расходе ключа.' : 'Шлюз не отвечает: ' + error, tone: 'warn' }))
+  }
+  const ownerLimit = user === null ? null : user.maxBudget
+  const ownerSpend = user === null ? null : user.spend
+  const ownerLeft = leftOf(ownerSpend, ownerLimit)
+  const ownerRatio = ownerLimit !== null && ownerLimit > 0 && ownerSpend !== null ? Math.min(100, Math.round((ownerSpend / ownerLimit) * 100)) : 0
+  const ownerTone = spendTone(ownerSpend, ownerLimit)
+  const ownerWindow = user === null || user.budgetDuration === '' ? '' : ' за ' + user.budgetDuration
+  const resetAt = user === null ? '' : resetOf(user.resetAt)
+  const keyLimitText = key === null ? ''
+    : key.maxBudget === null
+      ? ' · лимита на ключе нет'
+      : ' · лимит ' + moneyOf(key.maxBudget) + ' · осталось ' + moneyOf(leftOf(key.spend, key.maxBudget))
+  return h('div', { className: 'dshMcpCard' },
+    h('div', { className: 'dshMcpCardHead' },
+      h('div', null,
+        h('h3', { className: 'dshMcpCardTitle' }, 'Бюджет ключа'),
+        h('p', { className: 'dshMcpCardNote' }, 'Деньги считает шлюз LiteLLM: расход ключа и лимит его владельца.'))),
+    h('div', { className: 'dshMcpRow' },
+      h('div', { className: 'dshMcpRowMain' },
+        h('span', { className: 'dshMcpRowTitle' },
+          key === null ? 'Ключ' : 'Ключ «' + (key.alias !== '' ? key.alias : key.name) + '»'),
+        h('span', { className: 'dshMcpRowMeta' },
+          'израсходовано всего ' + moneyOf(key === null ? null : key.spend) + keyLimitText))),
+    user === null
+      ? null
+      : h('div', { className: 'dshMcpRow' },
+        h('div', { className: 'dshMcpRowMain' },
+          h('span', { className: 'dshMcpRowTitle' }, 'Лимит владельца' + ownerWindow),
+          h('span', { className: 'dshMcpRowMeta' },
+            moneyOf(ownerSpend) + ' из ' + moneyOf(ownerLimit)
+            + ' · осталось ' + moneyOf(ownerLeft)
+            + (resetAt === '' ? '' : ' · сброс ' + resetAt)),
+          h('div', { className: 'dshMcpBar' },
+            h('div', {
+              className: 'dshMcpBarFill' + (ownerTone === '' ? '' : ' dshMcpBarFill--' + ownerTone),
+              style: { width: String(ownerRatio) + '%' },
+            })))),
+    error === '' ? null : h(Notice, { text: 'Часть ответа шлюза недоступна: ' + error, tone: 'warn' }),
+    h('p', { className: 'dshMcpFoot' }, 'Источник — /key/info и /user/info шлюза; кеш на минуту, расход обновляется с задержкой в несколько секунд.'))
+}
+
 function AccessTab(props) {
   const data = props.data
   const tokens = Array.isArray(data.tokens) ? data.tokens : []
@@ -854,6 +946,7 @@ function AccessTab(props) {
         : h('p', { className: 'dshMcpFoot' },
           h('span', null, 'Скрытые: ' + hiddenTokens.map((token) => token.label).join(', ') + ' '),
           h(Button, { variant: 'outline', onClick: restoreAll }, 'Вернуть'))),
+    h(BudgetCard, { budget: data.budget }),
     dialog !== null && dialog.kind === 'connect'
       ? h(ConnectKeyDialog, {
         onClose: () => setDialog(null),

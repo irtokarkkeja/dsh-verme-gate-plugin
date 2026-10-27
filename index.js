@@ -343,10 +343,16 @@ export const Config = z.object({
   verifyTtlMs: z.number().default(300000),
   /**
    * Каталог промптов-инструкций (markdown), которые экран предлагает отправить в сессию.
-   * Читаются только файлы *.md в этом каталоге (без рекурсии); пусто — раздел «Промпты» скрыт.
-   * Пример: /home/seva/verme/agents/deploy/dsh-bootstrap (промпты «инструкция агенту»).
+   * Читаются только файлы *.md в этом каталоге (без рекурсии); пусто — встроенный набор из
+   * prompts/ пакета (сейчас там инструкция по браузерному MCP). Своя копия набора —
+   * deploy/dsh-bootstrap в монорепозитории.
    */
   promptsDir: z.string().default(''),
+  /**
+   * Кеш ответа шлюза о бюджете ключа (/key/info, /user/info), мс: экран настроек опрашивает
+   * состояние часто, а расход меняется медленно. 0 — спрашивать шлюз каждый раз.
+   */
+  budgetRefreshMs: z.number().min(0).default(60000),
 })
 
 /**
@@ -3284,6 +3290,63 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     lastError: retryState.lastError,
   })
 
+  /** Последний ответ шлюза о бюджете: id токена, когда спросили и что ответили. */
+  const budgetCache = { tokenId: '', at: 0, data: null }
+
+  /**
+   * Деньги ключа в шлюзе: расход и лимиты. LiteLLM считает spend сам (LiteLLM_SpendLogs) и
+   * отдаёт его виртуальному ключу по GET /key/info; лимит владельца ключа с окном
+   * budget_duration — по GET /user/info. У ключа лимита может не быть (max_budget: null) —
+   * тогда ограничивает только бюджет пользователя.
+   * @param {{id: string, keyRef: string}} token - активный токен.
+   * @returns {Promise<object>} блок budget для /api/state.
+   */
+  const describeBudget = async (token) => {
+    const ttl = Math.max(0, Number(cfg.budgetRefreshMs) || 0)
+    if (budgetCache.data !== null && budgetCache.tokenId === token.id && Date.now() - budgetCache.at < ttl) {
+      return budgetCache.data
+    }
+    const key = token.keyRef !== '' ? await readSecret(token.keyRef) : ''
+    if (key === '') {
+      return { tokenId: token.id, key: null, user: null, error: 'ключ токена не задан', fetchedAt: Date.now() }
+    }
+    const keyAnswer = await gatewayGet('/key/info', key)
+    const userAnswer = await gatewayGet('/user/info', key)
+    /** Число из ответа шлюза либо null: LiteLLM кладёт в поля null, когда лимит не задан. */
+    const numOf = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null)
+    const info = keyAnswer.body !== undefined && keyAnswer.body !== null && keyAnswer.body.info ? keyAnswer.body.info : null
+    const userInfo = userAnswer.body !== undefined && userAnswer.body !== null && userAnswer.body.user_info ? userAnswer.body.user_info : null
+    const data = {
+      tokenId: token.id,
+      key: info === null ? null : {
+        name: String(info.key_name || ''),
+        alias: String(info.key_alias || ''),
+        spend: numOf(info.spend),
+        maxBudget: numOf(info.max_budget),
+        budgetDuration: String(info.budget_duration || ''),
+        resetAt: String(info.budget_reset_at || ''),
+        expires: String(info.expires || ''),
+        blocked: info.blocked === true,
+        models: Array.isArray(info.models) ? info.models.length : 0,
+        lastActive: String(info.last_active || ''),
+      },
+      user: userInfo === null ? null : {
+        id: String(userInfo.user_id || ''),
+        maxBudget: numOf(userInfo.max_budget),
+        spend: numOf(userInfo.spend),
+        budgetDuration: String(userInfo.budget_duration || ''),
+        resetAt: String(userInfo.budget_reset_at || ''),
+      },
+      error: keyAnswer.error || userAnswer.error || '',
+      fetchedAt: Date.now(),
+    }
+    budgetCache.tokenId = token.id
+    budgetCache.at = Date.now()
+    budgetCache.data = data
+    if (data.error !== '') journal('бюджет: ' + data.error)
+    return data
+  }
+
   /**
    * Снимок состояния для страницы: серверы (без значений токенов), токены, гранты, монтирования.
    * @returns {Promise<object>} состояние.
@@ -3413,8 +3476,13 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         })),
       })
     }
+    const activeTokenRecord = catalog.tokens.get(state.activeToken)
     return {
       activeToken: state.activeToken,
+      /** Деньги активного ключа в шлюзе: расход ключа и недельный лимит его владельца. */
+      budget: activeTokenRecord === undefined
+        ? { tokenId: '', key: null, user: null, error: 'активный токен не выбран', fetchedAt: Date.now() }
+        : await describeBudget(activeTokenRecord),
       /** Скрытые токены конфига: записи в конфиге живы, экран и гранты их не видят. */
       hiddenTokens: [...hiddenTokens].map((id) => {
         const token = catalog.tokens.get(id)
