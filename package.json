@@ -1,6 +1,6 @@
 {
   "name": "verme-gate",
-  "version": "0.3.15",
+  "version": "0.3.16",
   "private": true,
   "type": "module",
   "description": "verme-gate (ex dsh-mcp-access) — DSH plugin: LiteLLM token = access profile for MCP servers/tools/models, native settings screen",

@@ -3335,39 +3335,43 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       '/spend/logs?start_date=' + dayOf(weekStartDate) + '&end_date=' + dayOf(tomorrowDate),
       key
     )
-    const spendByDay = new Map()
+    const rowByDay = new Map()
     if (Array.isArray(spendAnswer.body)) {
       for (const entry of spendAnswer.body) {
         if (entry === null || entry === undefined) continue
-        spendByDay.set(String(entry.startTime || ''), numOf(entry.spend))
+        rowByDay.set(String(entry.startTime || ''), entry)
       }
+    }
+    // Каждая дневная строка несёт spend и models — берём оба, чтобы клиент мог раскрыть любой день.
+    const modelsOfRow = (row) => {
+      const models = row.models !== null && row.models !== undefined && typeof row.models === 'object' ? row.models : {}
+      const allModels = Object.keys(models)
+        .map((name) => ({ model: name, spend: numOf(models[name]) || 0 }))
+        .sort((left, right) => right.spend - left.spend)
+      // Шлём запасом: обрезка списка — на клиенте, чтобы менять вид без правки хоста.
+      return { models: allModels.slice(0, 24), total: allModels.length }
     }
     // Неделя всегда ровно семь точек (нули включительно) — клиенту нечем ошибиться в столбиках.
     const weekDays = []
     for (let back = 6; back >= 0; back -= 1) {
       const day = dayOf(new Date(Date.now() - back * 86400000))
-      const value = spendByDay.get(day)
-      weekDays.push({ day: day, spend: value === undefined ? null : value })
+      const row = rowByDay.get(day)
+      if (row === undefined) {
+        weekDays.push({ day: day, spend: null, models: [], modelsTotal: 0 })
+        continue
+      }
+      const parts = modelsOfRow(row)
+      weekDays.push({ day: day, spend: numOf(row.spend), models: parts.models, modelsTotal: parts.total })
     }
     const weekTotal = weekDays.reduce((sum, entry) => sum + (entry.spend === null ? 0 : entry.spend), 0)
-    const todayRow = Array.isArray(spendAnswer.body)
-      ? spendAnswer.body.find((entry) => entry !== null && entry !== undefined && String(entry.startTime || '') === today)
-      : undefined
-    let todaySpend = null
-    let todayModels = []
-    let todayModelsTotal = 0
-    if (todayRow !== undefined && todayRow !== null) {
-      todaySpend = numOf(todayRow.spend)
-      const models = todayRow.models !== null && todayRow.models !== undefined && typeof todayRow.models === 'object' ? todayRow.models : {}
-      const allModels = Object.keys(models)
-        .map((name) => ({ model: name, spend: numOf(models[name]) || 0 }))
-        .sort((left, right) => right.spend - left.spend)
-      // Шлём запасом: обрезка списка — на клиенте, чтобы менять вид без правки хоста.
-      todayModels = allModels.slice(0, 24)
-      todayModelsTotal = allModels.length
-    } else if (Array.isArray(spendAnswer.body) && spendAnswer.body.length > 0) {
-      todaySpend = 0
+    // Сегодняшней строки может не быть при живых прошлых днях — это ноль, а не «нет данных».
+    if (weekDays.length > 0 && weekDays[weekDays.length - 1].spend === null && rowByDay.size > 0) {
+      weekDays[weekDays.length - 1].spend = 0
     }
+    const todayEntry = weekDays.length > 0 ? weekDays[weekDays.length - 1] : null
+    const todaySpend = todayEntry === null ? null : todayEntry.spend
+    const todayModels = todayEntry === null ? [] : todayEntry.models
+    const todayModelsTotal = todayEntry === null ? 0 : todayEntry.modelsTotal
     const data = {
       tokenId: token.id,
       key: info === null ? null : {

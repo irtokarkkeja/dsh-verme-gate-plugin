@@ -131,7 +131,11 @@ const STYLE = [
 '.dshMoneySectionHead{display:flex;align-items:baseline;justify-content:space-between;gap:12px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}',
 '.dshMoneySectionMeta{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}',
 '.dshMoneyDays{display:flex;align-items:flex-end;gap:6px;height:64px}',
-'.dshMoneyDay{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px;height:100%;min-width:0}',
+'.dshMoneyDay{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px;height:100%;min-width:0;border:0;background:none;padding:0;font-family:inherit;cursor:pointer}',
+'.dshMoneyDay:hover .dshMoneyDayLabel{color:var(--dsw-alias-label-secondary)}',
+'.dshMoneyDay--active .dshMoneyDayLabel{color:var(--dsw-alias-label-primary);font-weight:600}',
+'.dshMoneyDay--active .dshMoneyDayBar{background:var(--dsw-alias-state-business-primary, #4176e6);box-shadow:0 0 0 1.5px var(--dsw-alias-bg-base), 0 0 0 2.5px var(--dsw-alias-state-business-primary, #4176e6)}',
+'.dshMoneyDay:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color);outline-offset:2px;border-radius:var(--dsw-radius-sm)}',
 '.dshMoneyDayBar{width:100%;max-width:34px;border-radius:3px 3px 0 0;background:var(--dsw-alias-state-business-primary, #4176e6);min-height:2px}',
 '.dshMoneyDayBar--muted{background:var(--dsw-alias-border-l2)}',
 '.dshMoneyDayLabel{font-size:10px;line-height:14px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}',
@@ -878,6 +882,7 @@ function spendTone(spend, maxBudget) {
  */
 function BudgetCard(props) {
   const [expandModels, setExpandModels] = useState(false)
+  const [activeDay, setActiveDay] = useState('')
   const budget = props.budget !== null && props.budget !== undefined ? props.budget : {}
   const key = budget.key !== null && budget.key !== undefined ? budget.key : null
   const user = budget.user !== null && budget.user !== undefined ? budget.user : null
@@ -900,12 +905,24 @@ function BudgetCard(props) {
   const ownerTone = spendTone(ownerSpend, ownerLimit)
   const ownerWindow = user === null || user.budgetDuration === '' ? '' : ' за ' + user.budgetDuration
   const resetAt = user === null ? '' : resetOf(user.resetAt)
-  const models = today === null || !Array.isArray(today.models) ? [] : today.models
-  const modelsTotal = today !== null && typeof today.modelsTotal === 'number' ? today.modelsTotal : models.length
+  const weekDays = week !== null && Array.isArray(week.days) ? week.days : []
+  // Выбранный день: пустое значение — сегодня. Нет недели — падаем на блок today из того же ответа.
+  const fallbackDay = today === null
+    ? null
+    : { day: today.day, spend: today.spend, models: today.models, modelsTotal: today.modelsTotal }
+  const selectedDay = activeDay === ''
+    ? (weekDays.length > 0 ? weekDays[weekDays.length - 1] : fallbackDay)
+    : (weekDays.find((entry) => entry.day === activeDay) || fallbackDay)
+  const models = selectedDay === null || !Array.isArray(selectedDay.models) ? [] : selectedDay.models
+  const modelsTotal = selectedDay !== null && typeof selectedDay.modelsTotal === 'number'
+    ? selectedDay.modelsTotal
+    : models.length
   const shownModels = expandModels ? models : models.slice(0, 6)
   const hiddenModels = Math.max(0, modelsTotal - shownModels.length)
   const dayTop = models.length > 0 ? Math.max(models[0].spend, 0.000001) : 1
-  const weekDays = week !== null && Array.isArray(week.days) ? week.days : []
+  // Клик по последнему столбику — это снова «сегодня», а не «модели за дату».
+  const isTodaySelected = selectedDay !== null
+    && (weekDays.length > 0 ? selectedDay.day === weekDays[weekDays.length - 1].day : true)
   const weekValues = weekDays.map((entry) => (entry.spend === null ? 0 : entry.spend))
   const weekTop = weekValues.length > 0 ? Math.max.apply(null, weekValues.concat([0.000001])) : 1
   const tile = (label, value, title) => h('div', { className: 'dshMoneyTile' },
@@ -948,23 +965,36 @@ function BudgetCard(props) {
       h('div', { className: 'dshMoneySectionHead' },
         h('span', null, 'Расход по дням'),
         h('span', { className: 'dshMoneySectionMeta' }, 'за неделю ' + moneyOf(week.total))),
-      h('div', { className: 'dshMoneyDays' }, weekDays.map((entry) => h('div', {
-        className: 'dshMoneyDay',
-        key: entry.day,
-        title: entry.day + ': ' + (entry.spend === null ? 'нет данных' : moneyOf(entry.spend)),
-      },
-      h('div', {
-        className: 'dshMoneyDayBar' + (entry.spend === null || entry.spend <= 0 ? ' dshMoneyDayBar--muted' : ''),
-        style: { height: String(Math.max(2, Math.round(((entry.spend === null ? 0 : entry.spend) / weekTop) * 100))) + '%' },
-      }),
-      h('div', { className: 'dshMoneyDayLabel' }, shortDay(entry.day)))))),
+      h('div', { className: 'dshMoneyDays' }, weekDays.map((entry) => {
+        const isActive = selectedDay !== null && selectedDay.day === entry.day
+        return h('button', {
+          type: 'button',
+          className: 'dshMoneyDay' + (isActive ? ' dshMoneyDay--active' : ''),
+          key: entry.day,
+          title: entry.day + ': ' + (entry.spend === null ? 'нет данных' : moneyOf(entry.spend)),
+          'aria-pressed': isActive,
+          onClick: () => {
+            setActiveDay(entry.day)
+            setExpandModels(false)
+          },
+        },
+        h('div', {
+          className: 'dshMoneyDayBar' + (entry.spend === null || entry.spend <= 0 ? ' dshMoneyDayBar--muted' : ''),
+          style: { height: String(Math.max(2, Math.round(((entry.spend === null ? 0 : entry.spend) / weekTop) * 100))) + '%' },
+        }),
+        h('div', { className: 'dshMoneyDayLabel' }, shortDay(entry.day)))
+      }))),
     h('div', { className: 'dshMoneySection' },
       h('div', { className: 'dshMoneySectionHead' },
-        h('span', null, 'Сегодня по моделям'),
+        h('span', null, isTodaySelected || selectedDay === null
+          ? 'Сегодня по моделям'
+          : 'Модели за ' + shortDay(selectedDay.day)),
         h('span', { className: 'dshMoneySectionMeta' },
-          today === null ? '' : moneyOf(today.spend) + (modelsTotal > 0 ? ' · моделей ' + String(modelsTotal) : ''))),
-      today === null || models.length === 0
-        ? h('p', { className: 'dshMcpFoot' }, 'Сегодня расхода ещё не было.')
+          selectedDay === null ? '' : moneyOf(selectedDay.spend) + (modelsTotal > 0 ? ' · моделей ' + String(modelsTotal) : ''))),
+      selectedDay === null || models.length === 0
+        ? h('p', { className: 'dshMcpFoot' }, isTodaySelected || selectedDay === null
+          ? 'Сегодня расхода ещё не было.'
+          : 'В этот день расхода не было.')
         : h('div', { className: 'dshMoneyTable' },
           shownModels.map((entry) => h('div', { className: 'dshMoneyRow', key: entry.model },
             h('span', { className: 'dshMoneyRowName', title: entry.model }, shortModel(entry.model)),
