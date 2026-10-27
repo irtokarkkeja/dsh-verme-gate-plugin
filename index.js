@@ -53,11 +53,11 @@
  */
 
 import { createRequire } from 'node:module'
-import { pathToFileURL } from 'node:url'
+import { pathToFileURL, fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
-import { readFile, mkdir, writeFile, rename, stat, appendFile, chmod } from 'node:fs/promises'
+import { readFile, readdir, mkdir, writeFile, rename, stat, appendFile, chmod } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { join, dirname, basename } from 'node:path'
 import { homedir } from 'node:os'
 
 const LOG_PREFIX = '[dsh-mcp-access]'
@@ -341,6 +341,12 @@ export const Config = z.object({
   verifyTimeoutMs: z.number().default(10000),
   /** Кеш результата проверки (пока отпечаток токена тот же), мс. */
   verifyTtlMs: z.number().default(300000),
+  /**
+   * Каталог промптов-инструкций (markdown), которые экран предлагает отправить в сессию.
+   * Читаются только файлы *.md в этом каталоге (без рекурсии); пусто — раздел «Промпты» скрыт.
+   * Пример: /home/seva/verme/agents/deploy/dsh-bootstrap (промпты «инструкция агенту»).
+   */
+  promptsDir: z.string().default(''),
 })
 
 /**
@@ -3141,6 +3147,92 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     }
   }
 
+  /* ─────────────────────── промпты-инструкции для сессии ─────────────────────── */
+
+  /**
+   * Встроенный набор промптов: каталог `prompts/` рядом с этим файлом. Его наполняет
+   * scripts/sync-prompts.mjs из deploy/dsh-bootstrap, поэтому раздел работает без настройки.
+   */
+  const BUNDLED_PROMPTS_DIR = fileURLToPath(new URL('./prompts/', import.meta.url))
+
+  /**
+   * Откуда брать промпты: явная настройка promptsDir сильнее встроенного набора.
+   * @returns {{ dir: string, source: 'config'|'bundled' }} каталог и признак источника.
+   */
+  const promptsSource = () => {
+    const configured = String(cfg.promptsDir || '').trim()
+    return configured === '' ? { dir: BUNDLED_PROMPTS_DIR, source: 'bundled' } : { dir: configured, source: 'config' }
+  }
+
+  /**
+   * Заголовок промпта: первый markdown-заголовок «# …» в начале файла, иначе имя без расширения.
+   * @param {string} text - начало файла.
+   * @param {string} fallback - имя файла без .md.
+   * @returns {string} заголовок для списка.
+   */
+  const promptTitle = (text, fallback) => {
+    for (const line of String(text).split('\n').slice(0, 40)) {
+      const match = /^#\s+(.+)$/.exec(line.trim())
+      if (match !== null) return match[1].trim()
+    }
+    return fallback
+  }
+
+  /**
+   * Промпты каталога для раздела на экране: id (имя файла), заголовок, размер, дата изменения.
+   * Рекурсии нет: читаются только *.md верхнего уровня — предсказуемый набор, без обхода дерева.
+   * @returns {Promise<{ dir: string, prompts: object[], error: string }>} срез для клиента.
+   */
+  const listPrompts = async () => {
+    const { dir, source } = promptsSource()
+    let names = []
+    try {
+      names = (await readdir(dir)).filter((name) => /\.md$/i.test(name))
+    } catch (error) {
+      const hint = source === 'bundled'
+        ? 'встроенный набор промптов не найден, переустановите плагин'
+        : 'каталог promptsDir не читается'
+      return { dir, source, prompts: [], error: hint + ': ' + messageOf(error) }
+    }
+    names.sort((a, b) => a.localeCompare(b, 'ru'))
+    const prompts = []
+    for (const name of names) {
+      try {
+        const path = join(dir, name)
+        const info = await stat(path)
+        if (!info.isFile()) continue
+        // Заголовок берём из первых килобайт: полноразмерные инструкции бывают на 20-25 КБ.
+        const handle = await readFile(path, 'utf8')
+        prompts.push({
+          id: name,
+          title: promptTitle(handle.slice(0, 4096), name.replace(/\.md$/i, '')),
+          bytes: info.size,
+          updatedAt: info.mtimeMs,
+        })
+      } catch (error) {
+        journal('ERROR prompts: ' + name + ': ' + messageOf(error))
+      }
+    }
+    return { dir, source, prompts, error: '' }
+  }
+
+  /**
+   * Текст промпта по id. id — только базовое имя *.md из каталога промптов (никаких путей).
+   * @param {string} id - имя файла из списка.
+   * @returns {Promise<{ id?: string, title?: string, text?: string, error?: string }>} промпт или ошибка.
+   */
+  const readPrompt = async (id) => {
+    const { dir } = promptsSource()
+    const name = String(id || '').trim()
+    if (name === '' || name !== basename(name) || !/\.md$/i.test(name)) return { error: 'недопустимый id промпта' }
+    try {
+      const text = await readFile(join(dir, name), 'utf8')
+      return { id: name, title: promptTitle(text.slice(0, 4096), name.replace(/\.md$/i, '')), text }
+    } catch (error) {
+      return { error: 'промпт не читается: ' + messageOf(error) }
+    }
+  }
+
   /**
    * Текущая модель по умолчанию (seam ctx.agentDefaultModel).
    * @returns {{provider: string, model: string} | null} выбор или null.
@@ -3363,6 +3455,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       },
       servers,
       tokens,
+      // Раздел «Промпты»: что предлагает экран (текст читается отдельным POST /api/prompts/item).
+      prompts: await listPrompts(),
       models: {
         provider: modelState.provider,
         keyRef: modelState.keyRef,
@@ -4027,6 +4121,17 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       res.end(html)
     })
     register(pagePath + '/api/state', 'GET', async (req, res) => json(res, 200, await describeState()))
+    // Раздел «Промпты»: список markdown-инструкций из cfg.promptsDir и выдача текста по id.
+    // Отправкой в сессию занимается клиент (у него есть композер), хост только отдаёт текст.
+    register(pagePath + '/api/prompts', 'GET', async (req, res) => json(res, 200, await listPrompts()))
+    register(pagePath + '/api/prompts/item', 'POST', async (req, res) => {
+      const body = await readJsonBody(req, res)
+      if (body === null) return
+      const prompt = await readPrompt(body.id)
+      if (prompt.error !== undefined) return json(res, 400, prompt)
+      journal('prompts: выдан "' + prompt.id + '" (' + prompt.text.length + ' символов)')
+      json(res, 200, prompt)
+    })
     register(pagePath + '/api/diag', 'GET', async (req, res) => json(res, 200, await describeDiagnostics()))
     register(pagePath + '/api/refresh', 'POST', async (req, res) => {
       if (await readJsonBody(req, res) === null) return

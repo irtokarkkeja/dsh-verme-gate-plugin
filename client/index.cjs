@@ -1239,11 +1239,89 @@ function ExtraTab(props) {
       : null)
 }
 
+/**
+ * Вставка текста в композер активной сессии.
+ *
+ * Официального «положи в поле ввода» в клиентском рантайме нет, поэтому работаем с самим
+ * композером: он contenteditable, и текст принимается только как пользовательский ввод —
+ * execCommand('insertText') отправляет beforeinput+input, поэтому состояние React обновляется.
+ * Автоотправку не делаем: инструкция на 20 КБ должна попасть в сессию после того, как человек
+ * увидит, что именно он отправляет.
+ * @param {string} text - текст промпта.
+ * @returns {string} пустая строка — вставлено, иначе причина отказа.
+ */
+function insertPromptIntoComposer(text) {
+  const box = document.querySelector('div[role="textbox"][contenteditable="true"]')
+  if (box === null || box === undefined) return 'поле ввода сессии не найдено (открой новую сессию)'
+  box.focus()
+  const inserted = typeof document.execCommand === 'function' && document.execCommand('insertText', false, text)
+  if (inserted !== true) return 'браузер не дал вставить текст в поле ввода'
+  return ''
+}
+
+/**
+ * Раздел «Промпты»: markdown-инструкции из cfg.promptsDir с действиями «в сессию» и «копировать».
+ * @param {object} props - data с сервера (state.prompts).
+ * @returns {object} отрисованный раздел.
+ */
+function PromptsTab(props) {
+  const prompts = (props.data !== null && props.data !== undefined && props.data.prompts) ? props.data.prompts : {}
+  const dir = String(prompts.dir || '')
+  const source = String(prompts.source || 'bundled')
+  const items = Array.isArray(prompts.prompts) ? prompts.prompts : []
+  const listError = String(prompts.error || '')
+  const [notice, setNotice] = useState(null)
+  const [busy, setBusy] = useState('')
+  const fail = (error) => setNotice({ text: String(error && error.message ? error.message : error), tone: 'bad' })
+  const insert = (item) => {
+    setBusy(item.id)
+    setNotice(null)
+    callApi('POST', '/prompts/item', { id: item.id }).then((payload) => {
+      const text = String((payload && payload.text) || '')
+      if (text === '') throw new Error('промпт пустой')
+      const problem = insertPromptIntoComposer(text)
+      if (problem !== '') throw new Error(problem)
+      setNotice({ text: 'Промпт «' + item.title + '» вставлен в поле ввода — проверьте и отправьте.', tone: 'ok' })
+    }).catch(fail).then(() => setBusy(''))
+  }
+  const copy = (item) => {
+    setBusy(item.id)
+    setNotice(null)
+    callApi('POST', '/prompts/item', { id: item.id }).then((payload) => {
+      const text = String((payload && payload.text) || '')
+      if (navigator.clipboard === undefined) throw new Error('буфер обмена недоступен в этом браузере')
+      return navigator.clipboard.writeText(text)
+    }).then(() => setNotice({ text: 'Промпт «' + item.title + '» скопирован.', tone: 'ok' }))
+      .catch(fail).then(() => setBusy(''))
+  }
+  const sourceHint = source === 'bundled'
+    ? 'Встроенные промпты плагина — предметные инструкции из репозитория, настраивать нечего.'
+    : 'Инструкции из ' + dir + '.'
+  return h('div', { className: 'dshMcpBlock' },
+    h('div', { className: 'dshMcpBlockHead' },
+      h('h3', { className: 'dshMcpCardTitle' }, 'Промпты для сессии'),
+      h('p', { className: 'dshMcpHint' }, sourceHint + ' «В сессию» вставляет текст в поле ввода активной сессии — отправляете вы.')),
+    h(Notice, { text: notice === null ? '' : notice.text, tone: notice === null ? '' : notice.tone }),
+    h(Notice, { text: listError, tone: 'bad' }),
+    items.length === 0
+      ? h('div', { className: 'dshMcpEmpty' }, 'В каталоге нет ни одного .md.')
+      : h('div', { className: 'dshMcpList' }, items.map((item) => h('div', { className: 'dshMcpRow', key: item.id },
+        h('div', { className: 'dshMcpRowMain' },
+          h('div', { className: 'dshMcpRowTitle' }, item.title),
+          h('div', { className: 'dshMcpRowMeta' },
+            h('code', null, item.id), ' · ', String(Math.max(1, Math.round(Number(item.bytes || 0) / 1024))), ' КБ · ',
+            clockOf(item.updatedAt))),
+        h('div', { className: 'dshMcpActions' },
+          h(Button, { variant: 'primary', disabled: busy === item.id, onClick: () => insert(item) },
+            busy === item.id ? 'Вставляем…' : 'В сессию'),
+          h(Button, { variant: 'outline', disabled: busy === item.id, onClick: () => copy(item) }, 'Копировать'))))))
+}
+
 function MCPAccessPanel() {
   const store = useMcpState()
   const [tab, setTab] = useState('access')
   const tabRefs = useRef({})
-  const order = ['access', 'servers', 'extra']
+  const order = ['access', 'servers', 'prompts', 'extra']
   const onTabKey = (event) => {
     const index = order.indexOf(tab)
     let next = null
@@ -1260,6 +1338,7 @@ function MCPAccessPanel() {
   const tabs = [
     { id: 'access', label: 'Доступ' },
     { id: 'servers', label: 'Серверы и инструменты' },
+    { id: 'prompts', label: 'Промпты' },
     { id: 'extra', label: 'Дополнительно' },
   ]
   if (store.state.status === 'loading') {
@@ -1304,7 +1383,9 @@ function MCPAccessPanel() {
           'Личные значения сняты в шлюзе.'),
         onVerify: (server) => store.run('verify:' + server, '/verify', { server: server }, 'Проверка выполнена.', verifyNoticeOf),
       })
-      : h(ExtraTab, {
+      : tab === 'prompts'
+        ? h(PromptsTab, { data: data })
+        : h(ExtraTab, {
         data: data,
         busy: store.busy,
         onRefresh: store.reload,
