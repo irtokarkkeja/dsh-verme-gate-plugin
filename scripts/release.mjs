@@ -14,7 +14,7 @@
  */
 import { execFileSync } from 'node:child_process'
 import { readFile, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 
 const PLUGIN_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
@@ -105,8 +105,31 @@ if (options.mirror) {
   if (!existsSync(join(MIRROR_DIR, '.git'))) throw new Error('нет клона публикации: ' + MIRROR_DIR
     + ' (git clone git@github.com:irtokarkkeja/dsh-verme-gate-plugin.git ' + MIRROR_DIR + ')')
   const files = ['index.js', 'cordis.patch.yml', 'package.json', 'README.md', 'page.html', 'selftest.mjs', 'lib', 'client', 'prompts', 'scripts']
-  for (const file of files) run('cp', ['-a', join(PLUGIN_DIR, file), join(MIRROR_DIR, file)], MIRROR_DIR)
+  const dirs = ['lib', 'client', 'prompts', 'scripts']
+  // Урок 0.3.21–0.3.24: `cp -a src/lib mirror/lib` при существующем mirror/lib кладёт каталог
+  // ВНУТРЬ (mirror/lib/lib), а верхний mirror/lib/client.js остаётся от прошлой версии — так
+  // четыре релиза уехали в зеркало со старым клиентским бандлом (шапка «verme-gate 0.3.20»).
+  // Для каталогов — зеркальная синхронизация с удалением лишнего, для файлов — cp -aT.
+  for (const dir of dirs) {
+    const nested = join(MIRROR_DIR, dir, dir)
+    if (existsSync(nested)) rmSync(nested, { recursive: true, force: true })
+    run('rsync', ['-a', '--delete', join(PLUGIN_DIR, dir) + '/', join(MIRROR_DIR, dir) + '/'], MIRROR_DIR)
+  }
+  for (const file of files.filter((entry) => !dirs.includes(entry))) {
+    run('cp', ['-aT', join(PLUGIN_DIR, file), join(MIRROR_DIR, file)], MIRROR_DIR)
+  }
   run('git', ['add', '-A'], MIRROR_DIR)
+  // Проверка НА АРТЕФАКТЕ, а не только в монорепо: до этого selftest гонялся до копирования и
+  // красный пакет уезжал к коллегам.
+  const mirrorSelftest = run('node', [join(MIRROR_DIR, 'selftest.mjs')], MIRROR_DIR)
+  if (!mirrorSelftest.includes('selftest: PASS')) throw new Error('selftest в зеркале не прошёл (хвост:'
+    + ' ' + mirrorSelftest.split('\n').slice(-8).join(' | ') + ')')
+  const mirrorClient = readFileSync(join(MIRROR_DIR, 'lib', 'client.js'), 'utf8')
+  if (!mirrorClient.includes('verme-gate ' + next + ' ')) throw new Error('в зеркале lib/client.js не от ' + next
+    + ' (шапка: ' + (mirrorClient.split('\n')[0] || '').slice(0, 60) + ') — клиентский бандл не обновился')
+  const nestedLeft = run('git', ['ls-files'], MIRROR_DIR).split('\n').filter((path) => /^(lib|client|scripts|prompts)\/\1\//.test(path))
+  if (nestedLeft.length > 0) throw new Error('в зеркале вложенные дубли: ' + nestedLeft.slice(0, 5).join(', '))
+  process.stdout.write('зеркало проверено: selftest PASS, клиент ' + next + ', дублей нет\n')
   run('git', ['commit', '-m', 'verme-gate ' + next + ': ' + message], MIRROR_DIR)
   const tag = 'v' + next
   run('git', ['tag', '-a', tag, '-m', 'verme-gate ' + next], MIRROR_DIR)

@@ -11,9 +11,7 @@
     - id: verme-gate
       name: ./index.js
 
-# Модель по умолчанию — из маршрута плагина (id = llmProvider).
-- id: agent-default-model
-  config:
-    provider: dshlab
-    model: deepseek/deepseek-v4-pro
-    reasoningEffort: low
+# Модель по умолчанию плагин НЕ навязывает: иначе установка молча переключает профиль коллеги на
+# наш маршрут. Кому нужно — добавляет в patch-слой своего профиля сам:
+#   - id: agent-default-model
+#     config: { provider: dshlab, model: <id модели из прав ключа> }

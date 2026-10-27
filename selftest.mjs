@@ -435,6 +435,16 @@ check('проверка обновлений в UI: чип рядом с бюд�
   && client.includes('h(UpdateCard, null)')
   && client.includes('function useUpdateFeed(options)'))
 
+const bundlePatch = await readFile(new URL('cordis.patch.yml', here), 'utf8')
+/** Патч без комментариев: закомментированный пример — не объявление. */
+const bundlePatchCode = bundlePatch.split('\n').filter((line) => !line.trimStart().startsWith('#')).join('\n')
+check('сборка клиента отказывается собирать пустой/усечённый исходник (иначе экран исчезает молча)',
+  (await readFile(new URL('scripts/build-client.mjs', here), 'utf8')).includes('подозрительно пуст'))
+check('бандл-патч не навязывает модель по умолчанию (иначе установка молча переключает профиль коллеги)',
+  bundlePatchCode.includes('id: verme-gate')
+  && !bundlePatchCode.includes('agent-default-model')
+  && !bundlePatchCode.includes('deepseek/deepseek-v4-pro'))
+
 console.log('')
 console.log(failures === 0 ? 'selftest: PASS' : 'selftest: FAIL (' + failures + ')')
 process.exitCode = failures === 0 ? 0 : 1

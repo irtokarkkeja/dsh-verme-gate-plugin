@@ -114,6 +114,19 @@ const STYLE = [
 '.dshBudgetTipHead{font-weight:600;color:var(--dsw-alias-label-primary)}',
 '.dshBudgetTipRow{display:flex;justify-content:space-between;gap:14px}',
 '.dshBudgetTipValue{color:var(--dsw-alias-label-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}',
+// Чип обновления рядом с бюджетом: новая версия и/или несовместимая сборка DSH.
+'.dshUpdateChip{position:relative;display:inline-flex;align-items:center;gap:5px;font-size:11px;line-height:16px;color:var(--dsw-alias-state-business-primary,#4176e6);cursor:pointer;outline:none;border-radius:var(--dsw-radius-sm);padding:0 2px}',
+'.dshUpdateChip--warn{color:var(--dsw-alias-state-warn-primary)}',
+'.dshUpdateChip:hover,.dshUpdateChip:focus-visible{text-decoration:underline}',
+'.dshUpdateChip:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l2)}',
+'.dshUpdateDot{display:inline-block;width:6px;height:6px;border-radius:999px;background:currentColor}',
+'.dshUpdateTip{position:absolute;bottom:calc(100% + 8px);left:0;z-index:40;min-width:260px;max-width:min(380px,calc(100vw - 32px));padding:10px 12px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-base);box-shadow:0 6px 24px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:6px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);text-align:left;white-space:normal;cursor:default}',
+'.dshUpdateTipHead{font-weight:600;color:var(--dsw-alias-label-primary)}',
+'.dshUpdateCmd{display:block;font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11px;line-height:15px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-l2,#f3f4f6);border-radius:6px;padding:6px 8px;white-space:pre-wrap;word-break:break-all}',
+'.dshUpdateRow{display:flex;justify-content:space-between;gap:12px}',
+'.dshUpdateValue{color:var(--dsw-alias-label-primary);white-space:nowrap}',
+'.dshUpdateLink{color:var(--dsw-alias-state-business-primary,#4176e6);cursor:pointer;text-decoration:none}',
+'.dshUpdateLink:hover{text-decoration:underline}',
 // Карточка денег: герой с остатком, плитки, столбики по дням, таблица моделей.
 '.dshMoneyHero{display:flex;flex-direction:column;gap:10px;padding:14px 16px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md)}',
 '.dshMoneyHeroTop{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}',
@@ -929,7 +942,9 @@ function useBudgetFeed(options) {
 function BudgetCard(props) {
   const [expandModels, setExpandModels] = useState(false)
   const [activeDay, setActiveDay] = useState('')
-  const feed = useBudgetFeed({ initial: props.initial })
+  // live: карточка тоже обновляется сама — иначе открытая вкладка «замерзает» на цифрах
+  // момента открытия и выглядит как «бюджет не тратится».
+  const feed = useBudgetFeed({ initial: props.initial, live: true })
   if (feed.status === 'loading' && feed.data === null) {
     return h('div', { className: 'dshMcpCard' },
       h('div', { className: 'dshMcpCardHead' },
@@ -1020,6 +1035,7 @@ function BudgetCard(props) {
       h('div', { className: 'dshMoneySectionHead' },
         h('span', null, 'Расход по дням'),
         h('span', { className: 'dshMoneySectionMeta' }, 'за неделю ' + moneyOf(week.total))),
+      h('p', { className: 'dshMcpFoot' }, 'Сутки — в UTC, как их считает шлюз LiteLLM; обновление раз в минуту.'),
       h('div', { className: 'dshMoneyDays' }, weekDays.map((entry) => {
         const isActive = selectedDay !== null && selectedDay.day === entry.day
         return h('button', {
@@ -1069,7 +1085,8 @@ function BudgetCard(props) {
     error === '' ? null : h(Notice, { text: 'Часть ответа шлюза недоступна: ' + error, tone: 'warn' }),
     h('p', { className: 'dshMcpFoot' },
       'Источники: /key/info, /user/info, /team/info, /spend/logs шлюза. Расход обновляется с задержкой ~10 с; '
-      + 'для моделей без тарифа в шлюзе сумма занижена.'))
+      + 'для моделей без тарифа в шлюзе сумма занижена.'
+      + (typeof budget.fetchedAt === 'number' ? ' Данные на ' + new Date(budget.fetchedAt).toLocaleTimeString('ru-RU') + '.' : '')))
 }
 /**
  * Чип бюджета под композером: «$4.44 / $10.00» и полоска расхода; подробности — по наведению.
@@ -1132,6 +1149,240 @@ function BudgetChip() {
       style: { width: String(ratio) + '%' },
     })),
   tip)
+}
+
+
+/**
+ * Загрузчик проверки обновлений: /api/update отдельным запросом — это единственный поход плагина
+ * в интернет (GitHub), и настройки не должны его ждать. Сервер кеширует ответ на updateCheckMs.
+ * @param {{initial?: object|null, live?: boolean}} options - кеш из состояния и режим опроса.
+ * @returns {object|null} блок update либо null, пока не ответили.
+ */
+function useUpdateFeed(options) {
+  const settings = options !== null && options !== undefined ? options : {}
+  const initial = settings.initial !== null && settings.initial !== undefined ? settings.initial : null
+  const live = settings.live === true
+  const [data, setData] = useState(initial)
+  useEffect(() => {
+    let disposed = false
+    let timer
+    const load = () => {
+      callApi('GET', '/update').then((payload) => {
+        if (!disposed) setData(payload)
+      }).catch(() => {
+        /* молчание GitHub — не повод ломать чип: подробности в карточке настроек */
+      })
+    }
+    // Суточный кеш на хосте: чаще спрашивать бессмысленно, шести часов хватает.
+    const schedule = () => {
+      window.clearTimeout(timer)
+      if (disposed) return
+      timer = window.setTimeout(() => {
+        if (!document.hidden) load()
+        schedule()
+      }, 6 * 60 * 60 * 1000)
+    }
+    load()
+    if (live) schedule()
+    return () => {
+      disposed = true
+      window.clearTimeout(timer)
+    }
+  }, [live])
+  return data
+}
+
+/**
+ * Есть ли что сообщать про обновление: новая версия плагина и/или DSH вне проверенного диапазона.
+ * @param {object|null} data - блок update из /api/update.
+ * @returns {{available: boolean, dshBad: boolean, latest: string, version: string, dsh: object|null}|null} проблема.
+ */
+function updateProblemOf(data) {
+  if (data === null || data === undefined) return null
+  const available = data.available === true
+  const dsh = data.dsh !== null && data.dsh !== undefined ? data.dsh : null
+  const dshBad = dsh !== null && dsh.known === true && dsh.ok === false
+  if (!available && !dshBad) return null
+  return {
+    available,
+    dshBad,
+    latest: String(data.latest || ''),
+    version: String(data.version || ''),
+    dsh,
+  }
+}
+
+/**
+ * Положить текст в буфер обмена (кнопка «копировать»). Не умеет — молча false.
+ * @param {string} text - что копировать.
+ * @returns {Promise<boolean>} получилось ли.
+ */
+function copyText(text) {
+  if (typeof text !== 'string' || text === '') return Promise.resolve(false)
+  if (typeof navigator === 'undefined' || navigator.clipboard === undefined) return Promise.resolve(false)
+  if (typeof navigator.clipboard.writeText !== 'function') return Promise.resolve(false)
+  return navigator.clipboard.writeText(text).then(() => true).catch(() => false)
+}
+
+/**
+ * Чип обновления в доке композера, рядом с бюджетом: появляется только когда есть о чём сказать
+ * (новая версия или несовместимая сборка DSH). По наведению — команда обновления и совместимость.
+ * @returns {object|null} чип либо null, когда всё в порядке.
+ */
+function UpdateChip() {
+  const [open, setOpen] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const data = useUpdateFeed({ live: true })
+  const problem = updateProblemOf(data)
+  if (problem === null) return null
+  const dsh = problem.dsh
+  const dshVersion = dsh !== null && dsh.version !== '' ? String(dsh.version) : 'версия неизвестна'
+  const range = dsh !== null && dsh.range !== undefined ? String(dsh.range) : ''
+  const tested = Array.isArray(data.testedDsh) ? data.testedDsh : []
+  const command = String(data.installCommand || '')
+  const head = problem.available
+    ? 'Доступна версия ' + problem.latest + ' (у вас ' + problem.version + ')'
+    : 'DSH ' + dshVersion + ' вне проверенного диапазона'
+  const tip = open
+    ? h('span', { className: 'dshUpdateTip', role: 'tooltip' },
+      h('span', { className: 'dshUpdateTipHead' }, head),
+      problem.available
+        ? h('span', null, 'Обновление — поставить тег и перезапустить DSH (host-половина живёт до рестарта).')
+        : null,
+      problem.available && command !== '' ? h('code', { className: 'dshUpdateCmd' }, command) : null,
+      problem.available ? h('code', { className: 'dshUpdateCmd' }, 'systemctl --user restart <unit>') : null,
+      problem.available
+        ? h('span', { className: 'dshUpdateRow' },
+          h('a', {
+            className: 'dshUpdateLink',
+            href: String(data.tagsUrl || ''),
+            target: '_blank',
+            rel: 'noreferrer',
+          }, 'Что изменилось →'),
+          h('a', {
+            className: 'dshUpdateLink',
+            href: '#',
+            onClick: (event) => {
+              event.preventDefault()
+              copyText(command).then((ok) => setCopied(ok))
+            },
+          }, copied ? 'команда скопирована' : 'копировать команду'))
+        : null,
+      h('span', { className: 'dshUpdateRow' },
+        h('span', null, 'Работает на DSH'),
+        h('span', { className: 'dshUpdateValue' }, dshVersion + (dsh !== null && dsh.known === true && dsh.ok === true ? ' · ок' : ''))),
+      h('span', { className: 'dshUpdateRow' },
+        h('span', null, 'Объявлено'),
+        h('span', { className: 'dshUpdateValue' }, range === '' ? '—' : range)),
+      h('span', { className: 'dshUpdateRow' },
+        h('span', null, 'Проверено на'),
+        h('span', { className: 'dshUpdateValue' }, tested.length === 0 ? '—' : tested.join(', '))),
+      problem.dshBad
+        ? h('span', null, 'Эта сборка DSH не проверялась: возможны сбои гейта и монтирования. Поставьте DSH из проверенной линии или обновите плагин.')
+        : null,
+      h('span', { className: 'dshMcpFoot' }, 'Подробнее — verme-gate → Доступ → «Обновление плагина».')
+    )
+    : null
+  return h('span', {
+    className: 'dshUpdateChip' + (problem.available ? '' : ' dshUpdateChip--warn'),
+    role: 'status',
+    tabIndex: 0,
+    'aria-label': head,
+    onMouseEnter: () => setOpen(true),
+    onMouseLeave: () => setOpen(false),
+    onFocus: () => setOpen(true),
+    onBlur: () => setOpen(false),
+    onClick: () => setOpen(!open),
+  },
+  h('span', { className: 'dshUpdateDot' }),
+  h('span', null, problem.available ? 'обновление v' + problem.latest : 'DSH ' + dshVersion + ' не проверен'),
+  tip)
+}
+
+/**
+ * Карточка «Обновление плагина» в экране настроек: что установлено, что вышло, какие команды
+ * и какой диапазон DSH поддерживается (объявленный и проверенный). Свежая проверка — по кнопке.
+ * @returns {object} карточка.
+ */
+function UpdateCard() {
+  const [data, setData] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [copied, setCopied] = useState('')
+  const load = (force) => callApi('GET', force ? '/update?force=1' : '/update')
+  useEffect(() => {
+    let disposed = false
+    load(false).then((payload) => {
+      if (!disposed) setData(payload)
+    }).catch(() => {})
+    return () => {
+      disposed = true
+    }
+  }, [])
+  const check = () => {
+    setBusy(true)
+    load(true).then((payload) => setData(payload)).catch(() => {}).then(() => setBusy(false))
+  }
+  const loaded = data !== null && data !== undefined
+  const version = loaded ? String(data.version || '') : ''
+  const latest = loaded ? String(data.latest || '') : ''
+  const available = loaded && data.available === true
+  const error = loaded ? String(data.error || '') : ''
+  const dsh = loaded && data.dsh !== null && data.dsh !== undefined ? data.dsh : null
+  const tested = loaded && Array.isArray(data.testedDsh) ? data.testedDsh : []
+  const testedNote = loaded ? String(data.testedNote || '') : ''
+  const command = loaded ? String(data.installCommand || '') : ''
+  const rollback = loaded ? String(data.rollbackCommand || '') : ''
+  const checkedAt = loaded && typeof data.fetchedAt === 'number'
+    ? new Date(data.fetchedAt).toLocaleString('ru-RU')
+    : ''
+  const dshVersion = dsh !== null && dsh.version !== '' ? String(dsh.version) : 'неизвестна'
+  const dshBad = dsh !== null && dsh.known === true && dsh.ok === false
+  const copyCommand = (text) => copyText(text).then((ok) => setCopied(ok ? text : ''))
+  return h('div', { className: 'dshMcpCard' },
+    h('div', { className: 'dshMcpCardHead' },
+      h('div', null,
+        h('h3', { className: 'dshMcpCardTitle' }, 'Обновление плагина'),
+        h('p', { className: 'dshMcpCardNote' }, 'DSH не обновляет плагины сам: версия ставится командой и подхватывается рестартом.')),
+      h(Button, { variant: 'outline', onClick: check, disabled: busy }, busy ? 'Проверяем…' : 'Проверить')),
+    h('div', { className: 'dshMoneyTiles' },
+      h('div', { className: 'dshMoneyTile' },
+        h('span', { className: 'dshMoneyTileLabel' }, 'Установлено'),
+        h('span', { className: 'dshMoneyTileValue' }, version === '' ? '—' : 'v' + version)),
+      h('div', { className: 'dshMoneyTile' },
+        h('span', { className: 'dshMoneyTileLabel' }, 'Последняя'),
+        h('span', { className: 'dshMoneyTileValue' }, latest === '' ? '—' : 'v' + latest)),
+      h('div', { className: 'dshMoneyTile' },
+        h('span', { className: 'dshMoneyTileLabel' }, 'Проверено'),
+        h('span', { className: 'dshMoneyTileValue' }, checkedAt === '' ? 'ещё не проверяли' : checkedAt))),
+    available
+      ? h('div', { className: 'dshMcpStack' },
+        h(Notice, { text: 'Вышла версия ' + latest + ' (у вас ' + version + ').', tone: 'info' }),
+        h('p', { className: 'dshMcpFoot' }, 'Поставить тег и перезапустить DSH:'),
+        h('code', { className: 'dshUpdateCmd' }, command),
+        h('code', { className: 'dshUpdateCmd' }, 'systemctl --user restart <unit>'),
+        h('div', { className: 'dshMcpActions' },
+          h(Button, { variant: 'outline', onClick: () => copyCommand(command) }, copied === command ? 'скопировано' : 'копировать команду'),
+          h('a', { className: 'dshUpdateLink', href: String(data.tagsUrl || ''), target: '_blank', rel: 'noreferrer' }, 'Список версий →')),
+        rollback === '' ? null : h('p', { className: 'dshMcpFoot' }, 'Откат на текущую: ', h('code', null, rollback)))
+      : null,
+    loaded && !available && error === ''
+      ? h('p', { className: 'dshMcpFoot' }, 'Обновлений нет: установлена последняя версия.')
+      : null,
+    error !== '' ? h(Notice, { text: 'Не смогли узнать версию: ' + error, tone: 'warn' }) : null,
+    h('div', { className: 'dshMcpRow', style: { marginTop: '12px' } },
+      h('div', { className: 'dshMcpRowMain' },
+        h('span', { className: 'dshMcpRowTitle' }, 'Совместимость с DSH'),
+        h('span', { className: 'dshMcpRowMeta' },
+          'сейчас ' + dshVersion
+          + (dsh !== null && dsh.range !== undefined && dsh.range !== '' ? ' · объявлено ' + String(dsh.range) : '')
+          + (tested.length > 0 ? ' · проверено на ' + tested.join(', ') : '')))),
+    testedNote === '' ? null : h('p', { className: 'dshMcpFoot' }, 'Глубина прогонов: ' + testedNote + '.'),
+    dshBad
+      ? h(Notice, { text: 'Эта сборка DSH не проверялась (плагин собран под ' + String(dsh.range || '') + '): возможны сбои гейта и монтирования.', tone: 'warn' })
+      : null,
+    h('p', { className: 'dshMcpFoot' },
+      'Проверка ходит в GitHub за тегами репозитория ', h('code', null, String(loaded ? data.repo : '')),
+      '; ответ кешируется на сутки (updateCheckMs), сеть можно выключить (updateCheck: false).'))
 }
 
 function AccessTab(props) {
@@ -1206,6 +1457,7 @@ function AccessTab(props) {
           h('span', null, 'Скрытые: ' + hiddenTokens.map((token) => token.label).join(', ') + ' '),
           h(Button, { variant: 'outline', onClick: restoreAll }, 'Вернуть'))),
     h(BudgetCard, { initial: data.budget }),
+    h(UpdateCard, null),
     dialog !== null && dialog.kind === 'connect'
       ? h(ConnectKeyDialog, {
         onClose: () => setDialog(null),
@@ -1886,6 +2138,13 @@ function apply(ctx) {
     order: 20,
     inject: () => ({}),
   }, BudgetChip))
+  // Рядом с бюджетом: есть ли новая версия плагина и та ли сборка DSH, под которую он собран.
+  ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+    name: 'conversation.composer.dock',
+    id: 'verme-gate-update',
+    order: 21,
+    inject: () => ({}),
+  }, UpdateChip))
 }
 
 exports.NS = NS

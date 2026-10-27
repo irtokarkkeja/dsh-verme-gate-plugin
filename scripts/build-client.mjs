@@ -8,6 +8,14 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 
 const source = await readFile(new URL('../client/index.cjs', import.meta.url), 'utf8')
+// Пустой/усечённый исходник проходит проверку синтаксисом (пустой файл — валидная программа),
+// и тогда собирается «валидный» бандл без клиента: экран настроек исчезает без единой ошибки.
+// Инцидент 2026-10-28: client/index.cjs обнулился параллельной записью, сборка прошла молча.
+if (source.trim().length < 2000 || !/exports\.apply\s*=/.test(source)) {
+  console.error('client/index.cjs подозрительно пуст (' + source.length + ' байт): отказываюсь собирать'
+    + ' — проверь, не обнулил ли файл параллельный процесс (git checkout -- client/index.cjs)')
+  process.exit(1)
+}
 // Синтаксис проверяем до записи: битый бандл валит загрузку всех плагинов в клиенте.
 try {
   new Function('exports', 'module', 'require', source)
