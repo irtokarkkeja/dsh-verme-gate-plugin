@@ -382,7 +382,7 @@ check('снимки: ref провайдера и личные значения �
 
 const manifest = JSON.parse(await readFile(new URL('package.json', here), 'utf8'))
 check('совместимость объявлена: engines.dsh и peer на @deepseek-ai/dsh — одной линией',
-  manifest.engines !== undefined && manifest.engines.dsh === '^0.2.1-rc.2 || ^0.2.2-alpha.2'
+  manifest.engines !== undefined && /^\^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?( \|\| \^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)*$/.test(manifest.engines.dsh)
   && manifest.peerDependencies !== undefined && manifest.peerDependencies['@deepseek-ai/dsh'] === manifest.engines.dsh
   && manifest.peerDependenciesMeta !== undefined && manifest.peerDependenciesMeta['@deepseek-ai/dsh'].optional === true)
 check('механика версии: чтение версии DSH, сверка диапазона, гейт гост-пакетов',

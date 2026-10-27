@@ -1,5 +1,6 @@
 /**
- * dsh-mcp-access — «токен доступа = профиль» для DSH 0.2.1-rc.2 (host-only плагин).
+ * verme-gate (каталог по историческим причинам — plugins/dsh-mcp-access) — «токен доступа = профиль»
+ * для DSH 0.2.1-rc.2 (host-only плагин).
  *
  * Скоуп (решение владельца): плагин обслуживает ТОЛЬКО MCP, проксируемые шлюзом LiteLLM
  * (https://ai-labs-litellm.verme.ru/<server_name>/mcp). Локальные stdio-серверы — вне плагина.
@@ -198,8 +199,9 @@ function checkDshCompat(version, range) {
   if (version === '') return { known: false, ok: true, version: '', range }
   const semver = hostSemver()
   if (semver === null) return { known: false, ok: true, version, range }
-  // Как гейт DSH 0.2.1: без includePrerelease — иначе 0.2.2-alpha.2 прошёл бы по ^0.2.1-rc.2,
-  // хотя на нём плагин не проверяли.
+  // Сверяем БЕЗ includePrerelease — так же, как гейт DSH 0.2.0/0.1.7. Поэтому prerelease проходит
+  // диапазон только при точном совпадении кортежа: 0.2.2-alpha.2 попадает в объявленный диапазон,
+  // а 0.2.2-alpha.3 — уже нет (матрица проверенных сборок — в README).
   return { known: true, ok: semver.satisfies(version, range), version, range }
 }
 
@@ -404,9 +406,13 @@ export const Config = z.object({
   tokens: z.array(AccessToken).default([]),
   /** Активный токен по умолчанию (перекрывается stateFile, который пишет страница). */
   activeToken: z.string().default(''),
-  /** Путь страницы (exact-route веб-сервера), например /mcp-access. */
+  /** Путь страницы (exact-route веб-сервера), например /verme-gate. */
   pagePath: z.string().default('/verme-gate'),
-  /** Файл состояния активного токена; по умолчанию $DSH_HOME/storages/dsh-mcp-access.json. */
+  /**
+   * Файл состояния активного токена; по умолчанию $DSH_HOME/storages/dsh-mcp-access.json —
+   * имя оставлено историческим НАМЕРЕННО: переименование осиротило бы состояние существующих
+   * установок (активный токен и выбор серверов потерялись бы при обновлении плагина).
+   */
   stateFile: z.string().default(''),
   /** Журнал плагина (доказательства живых прогонов). */
   logFile: z.string().default(''),
@@ -492,8 +498,7 @@ export const Config = z.object({
   compactionHeadroomTokens: z.number().step(1).default(65536),
   /** Доля окна для порога автокомпакта — тоже только для диагностики (умолчание DSH 0.8). */
   compactionThresholdRatio: z.number().default(0.8),
-  /** Таймаут discovery-запроса (реестр, статус env, модели), мс. */
-  /** Таймаут одного запроса к шлюзу: под серией переключений 8 с не хватало (ловили abort). */
+  /** Таймаут одного запроса к шлюзу (реестр, статус env, модели): под серией переключений 8 с не хватало (ловили abort). */
   modelDiscoveryTimeoutMs: z.number().default(20000),
   retryDelaysMs: z.array(z.number()).default(DEFAULT_RETRY_DELAYS_MS),
   retryBackgroundMs: z.number().default(DEFAULT_RETRY_BACKGROUND_MS),
@@ -1655,6 +1660,9 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     return ''
   }
 
+  /** Сколько ждать активации фибера, прежде чем считать попытку неудачной. */
+  const mountTimeoutMs = Math.max(1000, Number(cfg.mountTimeoutMs) || 8000)
+
   /**
    * Монтировать сервер и дождаться активации, не полагаясь на числовой fiber.state (ревью F11):
    * семантический статус определяется наличием зарегистрированных тулзов сервера.
@@ -1662,10 +1670,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
    * @param {string} litellmKey - ключ активного токена.
    * @param {string} personalToken - личный серверный токен ('' — нет).
    * @param {Record<string, string>} [extraHeaders] - заголовки, которые требует сам сервис.
+   * @returns {Promise<object>} запись монтирования (status/error/tools).
    */
-  /** Сколько ждать активации фибера, прежде чем считать попытку неудачной. */
-  const mountTimeoutMs = Math.max(1000, Number(cfg.mountTimeoutMs) || 8000)
-
   const mount = async (server, litellmKey, personalToken, extraHeaders) => {
     let fiber
     try {
@@ -1954,7 +1960,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     try {
       const init = await post({
         jsonrpc: '2.0', id: 1, method: 'initialize',
-        params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'dsh-mcp-access-verify', version: '1' } },
+        params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'verme-gate-verify', version: '1' } },
       }, '')
       if (init.status === 401 || init.status === 403) {
         return { status: 'rejected', httpCode: init.status, reason: 'MCP initialize -> HTTP ' + init.status, text: '' }
@@ -2239,7 +2245,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
      * Строка «не смонтирован по причине» для сервера, которого уже нет в реестре (после «Отключить»
      * реестр пуст): запись строится по одному имени, чтобы причина осталась видимой.
      * @param {string} serverName - имя сервера.
-     * @param {string} status - 'no-active-token' | 'key-error' | 'no-env'. 
+     * @param {string} status - 'no-active-token' | 'key-error' | 'no-env'.
      * @param {string} reason - причина без секретов.
      */
     const skipKnown = (serverName, status, reason) => {
