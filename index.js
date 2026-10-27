@@ -319,7 +319,9 @@ const dshRuntime = detectDshRuntime()
  * Это не то же, что объявленный диапазон: диапазон решает, что грузить, а список говорит,
  * что проверено руками.
  */
-const DSH_TESTED_VERSIONS = ['0.2.1-rc.2']
+const DSH_TESTED_VERSIONS = ['0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4', '0.2.2-alpha.2']
+/** Что именно проверено на этих версиях: не все прогоны одинаковой глубины. */
+const DSH_TESTED_NOTE = '0.2.1-rc.2 — боевой (прод и лаба); остальные — старт, /api/state и маршрут моделей'
 /** Репозиторий публикации: из него берём теги для «доступна новая версия». */
 const DEFAULT_UPDATE_REPO = 'irtokarkkeja/dsh-verme-gate-plugin'
 /** Версия плагина: и в /api/state, и в сравнении с тегами публикации. */
@@ -777,6 +779,10 @@ export function apply(ctx, config) {
       + '): возможны падения; обновите плагин или поставьте DSH из проверенной линии')
   } else if (!dshCompat.known) {
     configWarnings.push('версию DSH определить не удалось — совместимость не проверена')
+  } else if (!DSH_TESTED_VERSIONS.includes(dshCompat.version)) {
+    // Диапазон шире списка прогонов: 0.2.2 / 0.2.2-beta проходят semver, но руками не проверялись.
+    configWarnings.push('на DSH ' + dshCompat.version + ' плагин не прогоняли (проверено: '
+      + DSH_TESTED_VERSIONS.join(', ') + ')')
   }
   /** Возможности ctx, без которых половина плагина бессмысленна: проверяем до первого монтирования. */
   const requiredCapabilities = [
@@ -3668,6 +3674,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       tagsUrl: 'https://github.com/' + repo + '/tags',
       dsh: dshCompat,
       testedDsh: DSH_TESTED_VERSIONS,
+      testedNote: DSH_TESTED_NOTE,
       fetchedAt: Date.now(),
     }
     /**
@@ -3786,6 +3793,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         repo: String(cfg.updateRepo || DEFAULT_UPDATE_REPO),
         dsh: dshCompat,
         testedDsh: DSH_TESTED_VERSIONS,
+        testedNote: DSH_TESTED_NOTE,
         fetchedAt: Date.now(),
       }
     }
@@ -4171,7 +4179,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
        */
       dsh: dshCompat,
       /** Версия плагина и проверенные версии DSH — чтобы экран не врал про «поддерживается». */
-      plugin: { version: SELF_VERSION, testedDsh: DSH_TESTED_VERSIONS },
+      plugin: { version: SELF_VERSION, testedDsh: DSH_TESTED_VERSIONS, testedNote: DSH_TESTED_NOTE },
       /** Кеш проверки обновлений (без сети); свежие данные отдаёт /api/update. */
       update: updatePeek(),
       phase: state.phase,
@@ -4347,7 +4355,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       modelsDegraded: modelState.degraded,
       currentDefaultModel: currentSelection(),
       // Версии: плагин, проверенные DSH, вердикт по текущей сборке и кеш проверки обновлений.
-      plugin: { version: SELF_VERSION, testedDsh: DSH_TESTED_VERSIONS },
+      plugin: { version: SELF_VERSION, testedDsh: DSH_TESTED_VERSIONS, testedNote: DSH_TESTED_NOTE },
       dsh: dshCompat,
       update: updatePeek(),
       liveProviders: llm && typeof llm.listProviders === 'function' ? llm.listProviders().map((provider) => provider.id) : [],

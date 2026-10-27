@@ -1329,6 +1329,7 @@ function UpdateCard() {
   const error = loaded ? String(data.error || '') : ''
   const dsh = loaded && data.dsh !== null && data.dsh !== undefined ? data.dsh : null
   const tested = loaded && Array.isArray(data.testedDsh) ? data.testedDsh : []
+  const testedNote = loaded ? String(data.testedNote || '') : ''
   const command = loaded ? String(data.installCommand || '') : ''
   const rollback = loaded ? String(data.rollbackCommand || '') : ''
   const checkedAt = loaded && typeof data.fetchedAt === 'number'
@@ -1375,6 +1376,7 @@ function UpdateCard() {
           'сейчас ' + dshVersion
           + (dsh !== null && dsh.range !== undefined && dsh.range !== '' ? ' · объявлено ' + String(dsh.range) : '')
           + (tested.length > 0 ? ' · проверено на ' + tested.join(', ') : '')))),
+    testedNote === '' ? null : h('p', { className: 'dshMcpFoot' }, 'Глубина прогонов: ' + testedNote + '.'),
     dshBad
       ? h(Notice, { text: 'Эта сборка DSH не проверялась (плагин собран под ' + String(dsh.range || '') + '): возможны сбои гейта и монтирования.', tone: 'warn' })
       : null,

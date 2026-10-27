@@ -381,8 +381,8 @@ check('снимки: ref провайдера и личные значения �
 
 const manifest = JSON.parse(await readFile(new URL('package.json', here), 'utf8'))
 check('совместимость объявлена: engines.dsh и peer на @deepseek-ai/dsh — одной линией',
-  manifest.engines !== undefined && manifest.engines.dsh === '^0.2.1-rc.2'
-  && manifest.peerDependencies !== undefined && manifest.peerDependencies['@deepseek-ai/dsh'] === '^0.2.1-rc.2'
+  manifest.engines !== undefined && manifest.engines.dsh === '^0.2.1-rc.2 || ^0.2.2-alpha.2'
+  && manifest.peerDependencies !== undefined && manifest.peerDependencies['@deepseek-ai/dsh'] === manifest.engines.dsh
   && manifest.peerDependenciesMeta !== undefined && manifest.peerDependenciesMeta['@deepseek-ai/dsh'].optional === true)
 check('механика версии: чтение версии DSH, сверка диапазона, гейт гост-пакетов',
   source.includes('const dshRuntime = detectDshRuntime()')
@@ -393,6 +393,10 @@ check('совместимость видна снаружи: /api/state.dsh и c
   source.includes('dsh: dshCompat,')
   && source.includes('const missingCapabilities = requiredCapabilities')
   && source.includes("'в этой сборке DSH нет: '"))
+check('матрица прогонов: 4 версии DSH объявлены проверенными, глубина — в заметке',
+  source.includes("const DSH_TESTED_VERSIONS = ['0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4', '0.2.2-alpha.2']")
+  && source.includes('const DSH_TESTED_NOTE = ')
+  && source.includes('DSH_TESTED_VERSIONS.includes(dshCompat.version)'))
 check('релиз одной командой: scripts/release.mjs есть и знает про зеркало и тег',
   manifest.scripts.release === 'node scripts/release.mjs'
   && (await readFile(new URL('scripts/release.mjs', here), 'utf8')).includes("const tag = 'v' + next"))
@@ -420,7 +424,7 @@ check('проверка обновлений: конфиг (вкл/репо/ке
   && source.includes('updateCheckMs: z.number().min(0).default(86400000)')
   && source.includes('updateTimeoutMs: z.number().default(5000)')
   && source.includes('update: updatePeek(),')
-  && source.includes('plugin: { version: SELF_VERSION, testedDsh: DSH_TESTED_VERSIONS }'))
+  && source.includes('plugin: { version: SELF_VERSION, testedDsh: DSH_TESTED_VERSIONS, testedNote: DSH_TESTED_NOTE }'))
 check('проверка обновлений в UI: чип рядом с бюджетом и карточка в настройках',
   client.includes('function UpdateChip()')
   && client.includes('function UpdateCard()')
