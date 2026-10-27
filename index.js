@@ -195,13 +195,39 @@ function detectDshRuntime() {
  */
 function checkDshCompat(version, range) {
   if (version === '') return { known: false, ok: true, version: '', range }
+  const semver = hostSemver()
+  if (semver === null) return { known: false, ok: true, version, range }
+  // Как гейт DSH 0.2.1: без includePrerelease — иначе 0.2.2-alpha.2 прошёл бы по ^0.2.1-rc.2,
+  // хотя на нём плагин не проверяли.
+  return { known: true, ok: semver.satisfies(version, range), version, range }
+}
+
+/**
+ * semver из установки хоста. Свой велосипед для диапазонов/сравнения версий не пишем: у DSH
+ * semver уже есть, а расхождение в трактовке prerelease стоило бы ложных вердиктов.
+ * @returns {object|null} модуль semver либо null, если его нет в сборке.
+ */
+function hostSemver() {
   try {
-    const semver = createRequire(join(dshRuntime.dir || process.cwd(), 'package.json'))('semver')
-    // Как гейт DSH 0.2.1: без includePrerelease — иначе 0.2.2-alpha.2 прошёл бы по ^0.2.1-rc.2,
-    // хотя на нём плагин не проверяли.
-    return { known: true, ok: semver.satisfies(version, range), version, range }
+    return createRequire(join(dshRuntime.dir || process.cwd(), 'package.json'))('semver')
   } catch {
-    return { known: false, ok: true, version, range }
+    return null
+  }
+}
+
+/**
+ * Версия самого плагина из его package.json: показывается в состоянии и сравнивается с тегами
+ * публикации. Плагин могут установить копией (link:/file:), поэтому читаем свой манифест, а не
+ * надеемся на путь установки.
+ * @returns {string} версия либо '' если манифест недоступен.
+ */
+function readSelfVersion() {
+  try {
+    const manifestPath = fileURLToPath(new URL('./package.json', import.meta.url))
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    return typeof manifest.version === 'string' ? manifest.version : ''
+  } catch {
+    return ''
   }
 }
 
@@ -288,6 +314,16 @@ function hostModuleUrl(spec, subpath = '') {
 const DSH_TESTED_RANGE = '^0.2.1-rc.2'
 /** Версия и каталог работающей DSH: нужны для честного вердикта совместимости и ошибок импорта. */
 const dshRuntime = detectDshRuntime()
+/**
+ * Версии DSH, на которых плагин реально прогоняли (матрица — в README и docs/reports).
+ * Это не то же, что объявленный диапазон: диапазон решает, что грузить, а список говорит,
+ * что проверено руками.
+ */
+const DSH_TESTED_VERSIONS = ['0.2.1-rc.2']
+/** Репозиторий публикации: из него берём теги для «доступна новая версия». */
+const DEFAULT_UPDATE_REPO = 'irtokarkkeja/dsh-verme-gate-plugin'
+/** Версия плагина: и в /api/state, и в сравнении с тегами публикации. */
+const SELF_VERSION = readSelfVersion()
 
 const z = (await import(pathToFileURL(hostResolve('@deepseek-ai/schemastery')).href)).default
 const McpClient = await hostImport('@deepseek-ai/dsh-mcp-client')
@@ -472,6 +508,18 @@ export const Config = z.object({
    * держать вкладку дольше. По истечении отдаём частичный ответ с error и без кеша.
    */
   budgetTimeoutMs: z.number().default(8000),
+  /**
+   * Проверять ли, что у плагина появилась версия новее: теги репозитория публикации.
+   * Проверка идёт только когда её просит экран/чип (и не чаще updateCheckMs), в фон не ходит.
+   * false — не ходить в сеть вовсе (например, изолированный стенд без интернета).
+   */
+  updateCheck: z.boolean().default(true),
+  /** Репозиторий публикации для проверки обновлений: 'owner/name' на GitHub. */
+  updateRepo: z.string().default('irtokarkkeja/dsh-verme-gate-plugin'),
+  /** Кеш проверки обновлений, мс (24 ч: версии плагина не выходят чаще раза в сутки). */
+  updateCheckMs: z.number().min(0).default(86400000),
+  /** Таймаут запроса к GitHub за тегами, мс. */
+  updateTimeoutMs: z.number().default(5000),
 })
 
 /**
@@ -3584,6 +3632,184 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     lastError: retryState.lastError,
   })
 
+  /** Последний ответ GitHub о тегах плагина: когда спросили и что узнали. */
+  const updateCache = { at: 0, data: null }
+  /** Проверка «в полёте»: чип и экран делят один поход в сеть (single-flight). */
+  const updatePending = { promise: null }
+
+  /**
+   * Кеш проверки обновлений без сети: /api/state отдаёт уже посчитанное (или null). Гонять
+   * GitHub на каждое открытие настроек нельзя — и по времени ответа, и по лимиту запросов.
+   * @returns {object|null} блок update либо null, если ещё не проверяли.
+   */
+  const updatePeek = () => {
+    if (updateCache.data === null) return null
+    const ttl = Math.max(0, Number(cfg.updateCheckMs) || 0)
+    return Object.assign({ stale: Date.now() - updateCache.at >= ttl }, updateCache.data)
+  }
+
+  /**
+   * Спросить у GitHub теги публикации и сравнить с собственной версией. Сеть — только здесь;
+   * фолбэк без GitHub API (лимит 60 запросов/час на IP) — манифест из main.
+   * @returns {Promise<object>} блок update: своя/последняя версия, отставание, команда обновления
+   *   и вердикт совместимости с текущей DSH.
+   */
+  const collectUpdate = async () => {
+    const repo = String(cfg.updateRepo || DEFAULT_UPDATE_REPO)
+    const timeoutMs = Math.max(1000, Number(cfg.updateTimeoutMs) || 5000)
+    const base = {
+      version: SELF_VERSION,
+      latest: '',
+      available: false,
+      behind: 0,
+      source: '',
+      error: '',
+      repo,
+      tagsUrl: 'https://github.com/' + repo + '/tags',
+      dsh: dshCompat,
+      testedDsh: DSH_TESTED_VERSIONS,
+      fetchedAt: Date.now(),
+    }
+    /**
+     * Прокси из окружения: Node уважает HTTPS_PROXY только при NODE_USE_ENV_PROXY=1, а на стендах
+     * без прямого выхода это единственный путь наружу. Если флаг не включён, берём ProxyAgent из
+     * undici хоста; нет undici — работаем как есть (ошибка честно уедет в /api/update).
+     * @returns {object|undefined} dispatcher для fetch либо undefined.
+     */
+    const proxyDispatcher = () => {
+      if (process.env.NODE_USE_ENV_PROXY === '1') return undefined
+      const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || ''
+      if (proxy === '') return undefined
+      try {
+        const undici = createRequire(join(dshRuntime.dir || process.cwd(), 'package.json'))('undici')
+        if (undici === null || typeof undici.ProxyAgent !== 'function') return undefined
+        return new undici.ProxyAgent(proxy)
+      } catch {
+        return undefined
+      }
+    }
+    const dispatcher = proxyDispatcher()
+    /** Один HTTP GET с дедлайном: молчащий GitHub не должен держать вкладку. */
+    const fetchText = async (url, accept) => {
+      /** Попытка: напрямую и, если сеть не пустила, через прокси-агент стенда. */
+      const attempt = async (agent) => {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), timeoutMs)
+        try {
+          const options = {
+            signal: controller.signal,
+            redirect: 'error',
+            headers: { accept, 'user-agent': 'verme-gate/' + (SELF_VERSION === '' ? 'unknown' : SELF_VERSION) },
+          }
+          if (agent !== undefined) options.dispatcher = agent
+          const response = await fetch(url, options)
+          if (!response.ok) return { error: 'HTTP ' + String(response.status) }
+          return { body: await response.text() }
+        } catch (error) {
+          return { error: messageOf(error) }
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+      const direct = await attempt(undefined)
+      if (direct.body !== undefined || dispatcher === undefined) return direct
+      const throughProxy = await attempt(dispatcher)
+      return throughProxy.body !== undefined ? throughProxy : { error: direct.error + ' / через прокси: ' + throughProxy.error }
+    }
+    const tagsAnswer = await fetchText('https://api.github.com/repos/' + repo + '/tags?per_page=100', 'application/vnd.github+json')
+    let versions = []
+    if (tagsAnswer.body !== undefined) {
+      try {
+        const parsed = JSON.parse(tagsAnswer.body)
+        if (Array.isArray(parsed)) {
+          versions = parsed
+            .map((entry) => String((entry && entry.name) || ''))
+            .filter((name) => /^v\d+\.\d+\.\d+$/.test(name))
+            .map((name) => name.slice(1))
+        }
+      } catch {
+        /* не JSON — уходим в фолбэк */
+      }
+    }
+    if (versions.length === 0) {
+      const manifestAnswer = await fetchText('https://raw.githubusercontent.com/' + repo + '/main/package.json', 'application/json')
+      if (manifestAnswer.body !== undefined) {
+        try {
+          const parsed = JSON.parse(manifestAnswer.body)
+          if (parsed !== null && typeof parsed === 'object' && typeof parsed.version === 'string') {
+            versions = [parsed.version]
+            base.source = 'manifest'
+          }
+        } catch {
+          /* ниже отдадим ошибку как есть */
+        }
+      }
+      if (versions.length === 0) {
+        base.error = tagsAnswer.error || manifestAnswer.error || 'не удалось узнать последнюю версию'
+        return base
+      }
+    } else {
+      base.source = 'tags'
+    }
+    const semver = hostSemver()
+    const sorted = semver === null ? versions.slice() : versions.slice().sort((left, right) => semver.compare(left, right))
+    const latest = sorted[sorted.length - 1]
+    base.latest = latest
+    const comparable = semver !== null && semver.valid(latest) !== null && semver.valid(SELF_VERSION) !== null
+    if (comparable) {
+      base.available = semver.gt(latest, SELF_VERSION)
+      base.behind = sorted.filter((version) => semver.gt(version, SELF_VERSION)).length
+    } else {
+      base.available = latest !== SELF_VERSION
+      base.behind = base.available ? 1 : 0
+    }
+    // Команда ставит ровно тот тег, который советуем: без него обновление «на latest» невоспроизводимо.
+    base.installCommand = 'dsh plugin --profile <профиль> add github:' + repo + '#v' + latest
+    base.rollbackCommand = SELF_VERSION === '' ? '' : 'dsh plugin --profile <профиль> add github:' + repo + '#v' + SELF_VERSION
+    return base
+  }
+
+  /**
+   * Проверка обновлений с кешем и дедлайном (как describeBudget): ошибка не залипает на TTL,
+   * параллельные вызовы делят один запрос, выключенная проверка не ходит в сеть вообще.
+   * @returns {Promise<object>} блок update.
+   */
+  const describeUpdate = async (force = false) => {
+    if (cfg.updateCheck !== true) {
+      return {
+        version: SELF_VERSION,
+        latest: '',
+        available: false,
+        behind: 0,
+        source: '',
+        error: 'проверка обновлений выключена (updateCheck: false)',
+        repo: String(cfg.updateRepo || DEFAULT_UPDATE_REPO),
+        dsh: dshCompat,
+        testedDsh: DSH_TESTED_VERSIONS,
+        fetchedAt: Date.now(),
+      }
+    }
+    const ttl = Math.max(0, Number(cfg.updateCheckMs) || 0)
+    if (force !== true && updateCache.data !== null && updateCache.data.error === '' && Date.now() - updateCache.at < ttl) {
+      return updateCache.data
+    }
+    if (updatePending.promise !== null) return updatePending.promise
+    updatePending.promise = (async () => {
+      try {
+        const data = await collectUpdate()
+        if (data.error === '') {
+          updateCache.at = Date.now()
+          updateCache.data = data
+        } else {
+          journal('обновления: ' + data.error)
+        }
+        return data
+      } finally {
+        updatePending.promise = null
+      }
+    })()
+    return updatePending.promise
+  }
   /** Последний ответ шлюза о бюджете: id токена, когда спросили и что ответили. */
   const budgetCache = { tokenId: '', at: 0, data: null }
   /** Сбор бюджета «в полёте»: параллельные запросы делят один поход в шлюз (single-flight). */
@@ -3939,6 +4165,10 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
        * путём гейт engines.dsh не применяется, поэтому правду об этом знает только сам плагин.
        */
       dsh: dshCompat,
+      /** Версия плагина и проверенные версии DSH — чтобы экран не врал про «поддерживается». */
+      plugin: { version: SELF_VERSION, testedDsh: DSH_TESTED_VERSIONS },
+      /** Кеш проверки обновлений (без сети); свежие данные отдаёт /api/update. */
+      update: updatePeek(),
       phase: state.phase,
       barrier: state.barrier,
       applyPending: state.applyPending,
@@ -4111,6 +4341,10 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       keyError: modelState.error,
       modelsDegraded: modelState.degraded,
       currentDefaultModel: currentSelection(),
+      // Версии: плагин, проверенные DSH, вердикт по текущей сборке и кеш проверки обновлений.
+      plugin: { version: SELF_VERSION, testedDsh: DSH_TESTED_VERSIONS },
+      dsh: dshCompat,
+      update: updatePeek(),
       liveProviders: llm && typeof llm.listProviders === 'function' ? llm.listProviders().map((provider) => provider.id) : [],
       liveCatalog: llm && typeof llm.listProviders === 'function' && typeof llm.listModels === 'function'
         ? await Promise.all((llm.listProviders() || []).map(async (provider) => ({
@@ -4672,6 +4906,11 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         ? { tokenId: '', key: null, user: null, team: null, today: null, error: 'активный токен не выбран', fetchedAt: Date.now() }
         : await describeBudget(token))
     })
+    // Обновления плагина: отдельным маршрутом, потому что это единственный поход в интернет
+    // (GitHub), а состояние экрана не должно от него зависеть. Кеш — updateCheckMs.
+    // ?force=1 — проверка «мимо кеша»: кнопка «Проверить» в экране настроек.
+    register(pagePath + '/api/update', 'GET', async (req, res) => json(res, 200,
+      await describeUpdate(String(req.url || '').includes('force'))))
     register(pagePath + '/api/diag', 'GET', async (req, res) => json(res, 200, await describeDiagnostics()))
     register(pagePath + '/api/refresh', 'POST', async (req, res) => {
       if (await readJsonBody(req, res) === null) return

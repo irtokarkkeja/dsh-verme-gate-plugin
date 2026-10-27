@@ -397,6 +397,26 @@ check('релиз одной командой: scripts/release.mjs есть и �
   manifest.scripts.release === 'node scripts/release.mjs'
   && (await readFile(new URL('scripts/release.mjs', here), 'utf8')).includes("const tag = 'v' + next"))
 
+check('проверка обновлений: маршрут /api/update, кеш и сравнение с тегами публикации',
+  source.includes("register(pagePath + '/api/update', 'GET'")
+  && source.includes('const collectUpdate = async () =>')
+  && source.includes('const describeUpdate = async (force = false) =>')
+  && source.includes('const updatePeek = () =>')
+  && source.includes("'dsh plugin --profile <профиль> add github:'"))
+check('проверка обновлений: конфиг (вкл/репо/кеш/таймаут) и блоки в /api/state и /api/diag',
+  source.includes('updateCheck: z.boolean().default(true)')
+  && source.includes('updateRepo: z.string().default(')
+  && source.includes('updateCheckMs: z.number().min(0).default(86400000)')
+  && source.includes('updateTimeoutMs: z.number().default(5000)')
+  && source.includes('update: updatePeek(),')
+  && source.includes('plugin: { version: SELF_VERSION, testedDsh: DSH_TESTED_VERSIONS }'))
+check('проверка обновлений в UI: чип рядом с бюджетом и карточка в настройках',
+  client.includes('function UpdateChip()')
+  && client.includes('function UpdateCard()')
+  && client.includes("id: 'verme-gate-update'")
+  && client.includes('h(UpdateCard, null)')
+  && client.includes('function useUpdateFeed(options)'))
+
 console.log('')
 console.log(failures === 0 ? 'selftest: PASS' : 'selftest: FAIL (' + failures + ')')
 process.exitCode = failures === 0 ? 0 : 1
