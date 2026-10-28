@@ -336,7 +336,11 @@ Pi-ai объявляет модели маршрута с тем набором 
 Сборка обязательна перед запуском: host отдаёт только готовый `lib/client.js` (формат
 `window.__ModuleLoader__.load({id, factory})`, внешние модули — `react` и базовые примитивы DSH).
 `client/index.cjs` — обычный CommonJS без JSX, поэтому сборка сводится к обёртке
-(`scripts/build-client.mjs`), без tsdown и node_modules.
+(`scripts/build-client.mjs`), без tsdown и node_modules. Если DSH запущен **из рабочего дерева**
+(path-плагин, лаба), после пересборки перезапусти инстанс: имя плагина и клиентский граф он
+читает на старте, иначе браузер получит граф со старым id и в консоли появится
+`loaded without registering "…" via __ModuleLoader__.load`. Установленный пакет (pnpm) этой
+ловушки не имеет — id каталога и `package.json.name` там совпадают.
 
 ### Раздел «Промпты»
 
@@ -562,6 +566,36 @@ peers). Диапазон = то, что реально прогнано: мат�
 
 Глубина прогонов разная и это видно в UI: `/api/state.plugin.testedDsh` + `testedNote`
 («0.2.1-rc.2 — боевой; остальные — старт, /api/state и маршрут моделей»).
+
+### Windows: пути и версия хоста (0.3.31)
+
+До 0.3.31 плагин был POSIX-only в проверках путей, и на Windows не поднимался вообще:
+
+1. `validatePath` требовал `path.startsWith('/')` (`index.js:738`) и вложенность проверял
+   префиксом `path.startsWith(dshHome + '/')` (`:742`, `:746`). При `DSH_HOME = C:\\Users\\<user>\\.dsh`
+   дефолтный `stateFile` (`:752`) валидацию не проходил → `stateFile = ''` → `routesEnabled = false`
+   (`:827`) → ни `/verme-gate`, ни `/verme-gate/api/*` не регистрировались, а клиентская половина
+   грузилась независимо и показывала «Плагин не отвечает. HTTP 404».
+2. `detectDshRuntime` искал пакет `@deepseek-ai/dsh` по подстроке `'/node_modules/@deepseek-ai/'` —
+   на Windows (обратные слэши) не находил, поэтому `/api/state.dsh.known` был `false` и проверка
+   совместимости молча отключалась.
+3. `hostResolve`/`hostNodeModulesDirs` знали только POSIX-корни (`/home/seva/dsh-prod021-pkg`,
+   `~/dsh-prod021-pkg`): на Windows глобальная установка (`%APPDATA%\\npm\\node_modules`) не находилась.
+
+Что сделано: проверки путей вынесены в [`lib/paths.js`](lib/paths.js) — вид пути определяется по
+строке (`C:\\…`/`\\\\server\\share` → win32-правила, иначе posix), вложенность считается через
+`path.relative()`, а не префиксом строки (прежний `startsWith` принимал `/home/u/.dsh2` за
+`/home/u/.dsh`). Каталоги установки хоста стали кроссплатформенными (env `DSH_PACKAGE_ROOT`,
+каталог запущенного процесса, `%APPDATA%\\npm\\node_modules`, `%ProgramFiles%\\nodejs\\node_modules`,
+глобальный npm на POSIX, dev-зеркала), а соседний `dsh` ищется подъёмом по предкам до
+`node_modules`, а не по подстроке. Заодно убраны `url.pathname` (`selftest.mjs`, `scripts/*.mjs`,
+`test/credentials-race.test.mjs` — на Windows он даёт `/C:/…`) и хардкод `/tmp` в путях зеркала.
+
+Проверки: [`test/paths.test.mjs`](test/paths.test.mjs) — 7 тестов на Windows- и POSIX-пути
+(включая дефолт `stateFile`, соседний каталог `.dsh-evil`, регистр, другой диск, смешанные виды);
+Windows-пути проверяются на Linux, потому что вид пути берётся из строки, а не из платформы.
+Живой прогон на 0.2.1-rc.2: `/verme-gate` и `/verme-gate/api/state` → 200, `phase: ready`,
+`configErrors: []`, `dsh: {known: true, ok: true, version: "0.2.1-rc.2"}`.
 
 ### Что осталось незакрытым
 

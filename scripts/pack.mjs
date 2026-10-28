@@ -29,9 +29,10 @@ import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-/** Каталог плагина (на уровень выше scripts/). */
-const PLUGIN_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
+/** Каталог плагина (на уровень выше scripts/). fileURLToPath: на Windows pathname даёт "/C:/...". */
+const PLUGIN_DIR = fileURLToPath(new URL('..', import.meta.url)).replace(/[\\/]$/, '')
 
 /** Обязательные в рантайме пути: без любого из них установка из тарбола не эквивалентна GitHub-тегу. */
 const REQUIRED = ['index.js', 'lib', 'client', 'prompts', 'page.html', 'cordis.patch.yml', 'README.md', 'package.json']
@@ -98,7 +99,7 @@ function hasRef(repoDir, ref) {
  */
 function buildEpoch(ref) {
   if (process.env.SOURCE_DATE_EPOCH) return Number(process.env.SOURCE_DATE_EPOCH)
-  const mirror = process.env.VERME_GATE_MIRROR_DIR || '/tmp/dsh-verme-gate-plugin'
+  const mirror = process.env.VERME_GATE_MIRROR_DIR || join(tmpdir(), 'dsh-verme-gate-plugin')
   const candidates = ref ? [PLUGIN_DIR, mirror] : [PLUGIN_DIR]
   for (const dir of candidates) {
     try {
@@ -154,7 +155,7 @@ try {
     // Тег живёт либо в монорепо (путь плагина = plugins/dsh-mcp-access), либо в standalone-клоне
     // зеркала (файлы в корне) — ищем в обоих, чтобы проверка работала и у автора, и у релизёра.
     const archive = join(staging, 'tag.tar')
-    const mirror = process.env.VERME_GATE_MIRROR_DIR || '/tmp/dsh-verme-gate-plugin'
+    const mirror = process.env.VERME_GATE_MIRROR_DIR || join(tmpdir(), 'dsh-verme-gate-plugin')
     if (hasRef(PLUGIN_DIR, options.fromTag)) {
       const top = run('git', ['rev-parse', '--show-toplevel'], PLUGIN_DIR)
       const prefix = PLUGIN_DIR.slice(top.length + 1)

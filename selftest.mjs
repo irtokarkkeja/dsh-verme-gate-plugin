@@ -6,7 +6,7 @@
  */
 import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { pathToFileURL } from 'node:url'
+import { pathToFileURL, fileURLToPath } from 'node:url'
 
 const here = new URL('./', import.meta.url)
 let failures = 0
@@ -25,7 +25,7 @@ const check = (name, ok, detail) => {
   console.log('FAIL ' + name + (detail ? ' — ' + detail : ''))
 }
 
-const module_ = await import(pathToFileURL(new URL('index.js', here).pathname).href)
+const module_ = await import(pathToFileURL(fileURLToPath(new URL('index.js', here))).href)
 check('модуль экспортирует контракт плагина',
   typeof module_.name === 'string' && typeof module_.apply === 'function' && module_.Config !== undefined,
   'name=' + module_.name + ' apply=' + typeof module_.apply)
@@ -495,9 +495,11 @@ const { execFileSync } = await import('node:child_process')
 let unitTestsOk = true
 let unitTestsDetail = ''
 try {
+  // fileURLToPath, а не url.pathname: на Windows pathname даёт "/C:/Users/..." и файл не находится.
   const testFiles = [
-    new URL('test/credentials-emergency.test.mjs', here).pathname,
-    new URL('test/credentials-race.test.mjs', here).pathname,
+    fileURLToPath(new URL('test/credentials-emergency.test.mjs', here)),
+    fileURLToPath(new URL('test/credentials-race.test.mjs', here)),
+    fileURLToPath(new URL('test/paths.test.mjs', here)),
   ]
   const missing = testFiles.filter((path) => !existsSync(path))
   if (missing.length > 0) throw new Error('тесты не приехали в пакет: ' + missing.join(', ')

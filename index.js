@@ -61,6 +61,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join, dirname, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { applyRefWithLock } from './lib/credentials-emergency.js'
+import { validatePathValue } from './lib/paths.js'
 
 const LOG_PREFIX = '[verme-gate]'
 /** POSIX-identifier credential-ref (копия REF_PATTERN, PKG/dsh-credentials/lib/index.js:13). */
@@ -89,6 +90,36 @@ const MAX_BODY_BYTES = 65536
 const MAX_TMP_RENAME_ATTEMPTS = 5
 
 /**
+ * Каталоги, где может лежать установка DSH-хоста. Набор обязан быть кроссплатформенным: на
+ * Windows DSH стоит глобально в %APPDATA%\\npm\\node_modules, и прежние POSIX-пути там ничего
+ * не находили — следствие было видно в состоянии плагина как dsh.known=false (проверка
+ * совместимости отключена) и как «пакет хоста не найден» на импорте undici.
+ * @returns {string[]} абсолютные каталоги-кандидаты (возможно несуществующие — фильтруют вызывающие).
+ */
+function hostInstallRoots() {
+  /** Добавить кандидата, если он задан. */
+  const push = (value) => {
+    if (typeof value === 'string' && value !== '') roots.push(value)
+  }
+  const roots = []
+  push(process.env.DSH_PACKAGE_ROOT)
+  if (typeof process.argv[1] === 'string' && process.argv[1] !== '') {
+    const binDir = dirname(process.argv[1])
+    // .../node_modules/@deepseek-ai/dsh/lib → .../node_modules → префикс установки
+    push(join(binDir, '..', '..', '..'))
+    push(join(binDir, '..', '..', '..', '..'))
+  }
+  push(process.env.APPDATA && join(process.env.APPDATA, 'npm', 'node_modules'))
+  push(process.env.ProgramFiles && join(process.env.ProgramFiles, 'nodejs', 'node_modules'))
+  push(join(homedir(), '.npm-global', 'lib', 'node_modules'))
+  push('/usr/local/lib/node_modules')
+  // dev-зеркала этого хоста: полный checkout DSH для лабораторных прогонов плагина
+  push(join(homedir(), 'dsh-prod021-pkg'))
+  push('/home/seva/dsh-prod021-pkg')
+  return [...new Set(roots)]
+}
+
+/**
  * Резолв host-пакетов из рантайма DSH, а не из каталога плагина: плагин живёт вне профиля,
  * bare-спецификаторы '@deepseek-ai/...' из его модуля не резолвятся. Точка входа хоста
  * (process.argv[1] = .../dsh/lib/bin.js) даёт тот же realpath модуля, что уже загружен хостом
@@ -100,12 +131,7 @@ const MAX_TMP_RENAME_ATTEMPTS = 5
 function hostResolve(spec) {
   const bases = []
   if (typeof process.argv[1] === 'string' && process.argv[1] !== '') bases.push(process.argv[1])
-  const roots = [
-    process.env.DSH_PACKAGE_ROOT,
-    '/home/seva/dsh-prod021-pkg',
-    join(homedir(), 'dsh-prod021-pkg'),
-  ].filter((root) => typeof root === 'string' && root !== '')
-  for (const root of roots) bases.push(join(root, 'package.json'))
+  for (const root of hostInstallRoots()) bases.push(join(root, 'package.json'))
   const failures = []
   for (const base of bases) {
     try {
@@ -143,6 +169,28 @@ function hostPackageRoot(entryPath, spec) {
 }
 
 /**
+ * Каталог пакета @deepseek-ai/dsh рядом с уже резолвнутым пакетом хоста: поднимаемся по предкам и
+ * на каждом node_modules проверяем @deepseek-ai/dsh. Прежний поиск по подстроке
+ * '/node_modules/@deepseek-ai/' был POSIX-only — на Windows (обратные слэши) не находил ничего,
+ * и detectDshRuntime отдавал version:'' (в состоянии плагина это dsh.known=false).
+ * @param {string} entryPath - абсолютный путь к файлу входа пакета-соседа.
+ * @returns {string} каталог пакета dsh ('' — не нашли).
+ */
+function findHostDshDir(entryPath) {
+  let dir = dirname(entryPath)
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (basename(dir) === 'node_modules') {
+      const candidate = join(dir, '@deepseek-ai', 'dsh')
+      if (existsSync(join(candidate, 'package.json'))) return candidate
+    }
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return ''
+}
+
+/**
  * Версия среды DSH, в которой работает плагин. Плагин грузится и как профильный бандл, и как
  * строка патча с абсолютным путём — во втором случае гейт совместимости DSH (dsh.bundle/engines.dsh)
  * не применяется вовсе, поэтому версию читаем сами.
@@ -166,24 +214,19 @@ function detectDshRuntime() {
   } catch {
     /* exports-карта dsh может не отдавать '.' — идём соседом */
   }
-  // 2. Сосед по node_modules: любой резолвнутый @deepseek-ai/dsh-* лежит рядом с dsh.
+  // 2. Сосед по node_modules: среди предков резолвнутого @deepseek-ai/dsh-* ищем каталог dsh.
   try {
-    const sibling = hostResolve('@deepseek-ai/dsh-mcp-client')
-    const marker = '/node_modules/@deepseek-ai/'
-    const at = sibling.lastIndexOf(marker)
-    if (at !== -1) {
-      const found = versionOf(join(sibling.slice(0, at), 'node_modules', '@deepseek-ai', 'dsh'))
-      if (found.version !== '') return found
-    }
+    const found = versionOf(findHostDshDir(hostResolve('@deepseek-ai/dsh-mcp-client')))
+    if (found.version !== '') return found
   } catch {
     /* нет и соседа — остаются корни установки */
   }
-  // 3. Корни установки: тот же список, что у hostResolve.
-  const roots = [process.env.DSH_PACKAGE_ROOT, '/home/seva/dsh-prod021-pkg', join(homedir(), 'dsh-prod021-pkg')]
-  for (const root of roots) {
-    if (typeof root !== 'string' || root === '') continue
+  // 3. Корни установки: тот же кроссплатформенный список, что у hostResolve.
+  for (const root of hostInstallRoots()) {
     const found = versionOf(join(root, 'node_modules', '@deepseek-ai', 'dsh'))
     if (found.version !== '') return found
+    const nested = versionOf(join(root, '@deepseek-ai', 'dsh'))
+    if (nested.version !== '') return nested
   }
   return { version: '', dir: '' }
 }
@@ -261,9 +304,7 @@ async function hostImport(spec) {
  */
 function hostNodeModulesDirs() {
   const dirs = []
-  const roots = [process.env.DSH_PACKAGE_ROOT, '/home/seva/dsh-prod021-pkg', join(homedir(), 'dsh-prod021-pkg')]
-  for (const root of roots) {
-    if (typeof root !== 'string' || root === '') continue
+  for (const root of hostInstallRoots()) {
     dirs.push(join(root, 'node_modules'))
     dirs.push(join(root))
   }
@@ -732,22 +773,15 @@ export function apply(ctx, config) {
    * @param {boolean} insideHome - требовать ли расположения внутри DSH_HOME.
    * @returns {string} принятый путь ('' — ошибка конфига).
    */
-  const validatePath = (value, fallback, label, insideHome) => {
-    const path = typeof value === 'string' && value !== '' ? value : fallback
-    if (path === '') return ''
-    if (!path.startsWith('/')) {
-      configErrors.push(label + ' "' + path + '" должен быть абсолютным путём (относительный зависит от CWD процесса)')
-      return ''
-    }
-    if (insideHome && !path.startsWith(dshHome + '/')) {
-      configErrors.push(label + ' "' + path + '" должен лежать внутри DSH_HOME (' + dshHome + ')')
-      return ''
-    }
-    if (!insideHome && !path.startsWith(dshHome + '/')) {
-      configWarnings.push(label + ' "' + path + '" вне DSH_HOME — пишем туда, куда указал оператор')
-    }
-    return path
-  }
+  const validatePath = (value, fallback, label, insideHome) => validatePathValue({
+    value,
+    fallback,
+    label,
+    insideHome,
+    dshHome,
+    errors: configErrors,
+    warnings: configWarnings,
+  })
 
   const stateFile = validatePath(cfg.stateFile, join(dshHome, 'storages', 'dsh-mcp-access.json'), 'stateFile', true)
   const logFile = validatePath(cfg.logFile, '', 'logFile', false)

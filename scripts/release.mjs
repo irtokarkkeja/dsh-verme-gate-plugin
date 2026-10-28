@@ -16,12 +16,14 @@ import { execFileSync } from 'node:child_process'
 import { readFile, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 
-const PLUGIN_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
+const PLUGIN_DIR = fileURLToPath(new URL('..', import.meta.url)).replace(/[\\/]$/, '')
 /** Монорепо: сюда коммитится сам плагин (ветка публикуется в gitlab). */
 const REPO_DIR = join(PLUGIN_DIR, '..', '..')
 /** Клон публикации: standalone-пакет с тегами vX, из него ставится `github:`-зависимость. */
-const MIRROR_DIR = process.env.VERME_GATE_MIRROR_DIR || '/tmp/dsh-verme-gate-plugin'
+const MIRROR_DIR = process.env.VERME_GATE_MIRROR_DIR || join(tmpdir(), 'dsh-verme-gate-plugin')
 const GITLAB_REMOTE = process.env.VERME_GATE_GITLAB_REMOTE || 'gitlab'
 const GITLAB_BRANCH = process.env.VERME_GATE_GITLAB_BRANCH || 'feat/dsh-verme-gate'
 const MIRROR_REMOTE = process.env.VERME_GATE_MIRROR_REMOTE || 'origin'

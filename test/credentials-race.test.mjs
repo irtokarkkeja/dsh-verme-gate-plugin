@@ -10,11 +10,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { createRequire } from 'node:module'
-import { pathToFileURL } from 'node:url'
+import { pathToFileURL, fileURLToPath } from 'node:url'
 
 const run = promisify(execFile)
 
@@ -22,9 +22,11 @@ const run = promisify(execFile)
 const hostEntry = async (spec, envName) => {
   const hint = process.env[envName]
   if (typeof hint === 'string' && hint !== '') return pathToFileURL(hint).href
+  // Кандидаты без хардкода чужой машины: env-подсказка, dev-зеркало в домашнем каталоге, профиль DSH.
   const bases = [
-    '/home/seva/dsh-prod021-pkg/package.json',
-    join(process.env.DSH_HOME || '', 'profiles/web/package.json'),
+    process.env.DSH_PACKAGE_ROOT ? join(process.env.DSH_PACKAGE_ROOT, 'package.json') : '',
+    join(homedir(), 'dsh-prod021-pkg', 'package.json'),
+    join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'profiles/web/package.json'),
   ].filter((base) => typeof base === 'string' && base !== '')
   for (const base of bases) {
     try {
@@ -49,7 +51,7 @@ test('две параллельные записи в один store не тер
   const file = join(dir, '.credentials.yaml')
   await writeFile(file, 'version: 1\nrefs:\n  BASE: keep\n', { mode: 0o600 })
   try {
-    const writer = new URL('helpers/ref-writer.mjs', import.meta.url).pathname
+    const writer = fileURLToPath(new URL('helpers/ref-writer.mjs', import.meta.url))
     const env = { ...process.env, VERME_GATE_ATOMIC_URL: atomicUrl, VERME_GATE_YAML_URL: yamlUrl }
     // Два независимых процесса по 25 итераций: окно гонки — перекрытие read-modify-write.
     await Promise.all([

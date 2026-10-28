@@ -35,3 +35,9 @@ const banner = '/* ' + manifest.name + ' ' + manifest.version + ' — сгене
 await mkdir(new URL('../lib/', import.meta.url), { recursive: true })
 await writeFile(new URL('../lib/client.js', import.meta.url), banner + '\n' + header + '\n' + source + '\n' + footer + '\n')
 console.log('lib/client.js собран из client/index.cjs')
+// Ловушка dev-стенда: DSH читает имя плагина и ревизию клиента при старте, а браузер получает
+// готовый граф строк (id -> url). Если инстанс поднят из рабочего дерева (path-плагин) и его не
+// перезапустить, новая сборка регистрируется под новым id, а граф ждёт старый: в консоли
+// «loaded without registering "<id>" via __ModuleLoader__.load» и «Failed to load plugins».
+console.warn('если DSH запущен из рабочего дерева (path-плагин), перезапусти инстанс: '
+  + 'имя плагина и клиентский граф кешируются на старте')
