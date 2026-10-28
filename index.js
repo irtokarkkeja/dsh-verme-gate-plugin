@@ -62,6 +62,7 @@ import { join, dirname, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { applyRefWithLock } from './lib/credentials-emergency.js'
 import { validatePathValue } from './lib/paths.js'
+import { hostInstallRoots, findHostDshDir, hostModuleUrl } from './lib/host-packages.js'
 
 const LOG_PREFIX = '[verme-gate]'
 /** POSIX-identifier credential-ref (копия REF_PATTERN, PKG/dsh-credentials/lib/index.js:13). */
@@ -88,36 +89,6 @@ const DEFAULT_RETRY_DELAYS_MS = [1000, 3000, 9000]
 const DEFAULT_RETRY_BACKGROUND_MS = 300000
 const MAX_BODY_BYTES = 65536
 const MAX_TMP_RENAME_ATTEMPTS = 5
-
-/**
- * Каталоги, где может лежать установка DSH-хоста. Набор обязан быть кроссплатформенным: на
- * Windows DSH стоит глобально в %APPDATA%\\npm\\node_modules, и прежние POSIX-пути там ничего
- * не находили — следствие было видно в состоянии плагина как dsh.known=false (проверка
- * совместимости отключена) и как «пакет хоста не найден» на импорте undici.
- * @returns {string[]} абсолютные каталоги-кандидаты (возможно несуществующие — фильтруют вызывающие).
- */
-function hostInstallRoots() {
-  /** Добавить кандидата, если он задан. */
-  const push = (value) => {
-    if (typeof value === 'string' && value !== '') roots.push(value)
-  }
-  const roots = []
-  push(process.env.DSH_PACKAGE_ROOT)
-  if (typeof process.argv[1] === 'string' && process.argv[1] !== '') {
-    const binDir = dirname(process.argv[1])
-    // .../node_modules/@deepseek-ai/dsh/lib → .../node_modules → префикс установки
-    push(join(binDir, '..', '..', '..'))
-    push(join(binDir, '..', '..', '..', '..'))
-  }
-  push(process.env.APPDATA && join(process.env.APPDATA, 'npm', 'node_modules'))
-  push(process.env.ProgramFiles && join(process.env.ProgramFiles, 'nodejs', 'node_modules'))
-  push(join(homedir(), '.npm-global', 'lib', 'node_modules'))
-  push('/usr/local/lib/node_modules')
-  // dev-зеркала этого хоста: полный checkout DSH для лабораторных прогонов плагина
-  push(join(homedir(), 'dsh-prod021-pkg'))
-  push('/home/seva/dsh-prod021-pkg')
-  return [...new Set(roots)]
-}
 
 /**
  * Резолв host-пакетов из рантайма DSH, а не из каталога плагина: плагин живёт вне профиля,
@@ -160,28 +131,6 @@ function hostPackageRoot(entryPath, spec) {
       } catch {
         /* битый манифест — поднимаемся выше */
       }
-    }
-    const parent = dirname(dir)
-    if (parent === dir) break
-    dir = parent
-  }
-  return ''
-}
-
-/**
- * Каталог пакета @deepseek-ai/dsh рядом с уже резолвнутым пакетом хоста: поднимаемся по предкам и
- * на каждом node_modules проверяем @deepseek-ai/dsh. Прежний поиск по подстроке
- * '/node_modules/@deepseek-ai/' был POSIX-only — на Windows (обратные слэши) не находил ничего,
- * и detectDshRuntime отдавал version:'' (в состоянии плагина это dsh.known=false).
- * @param {string} entryPath - абсолютный путь к файлу входа пакета-соседа.
- * @returns {string} каталог пакета dsh ('' — не нашли).
- */
-function findHostDshDir(entryPath) {
-  let dir = dirname(entryPath)
-  for (let depth = 0; depth < 8; depth += 1) {
-    if (basename(dir) === 'node_modules') {
-      const candidate = join(dir, '@deepseek-ai', 'dsh')
-      if (existsSync(join(candidate, 'package.json'))) return candidate
     }
     const parent = dirname(dir)
     if (parent === dir) break
@@ -294,64 +243,6 @@ async function hostImport(spec) {
       + String(error && error.message ? error.message : error))
   }
   return import(pathToFileURL(entry).href)
-}
-
-/**
- * Каталоги node_modules хоста, где искать пакет вручную: createRequire().resolve не умеет
- * ESM-only пакеты без условия "require" (например @earendil-works/pi-ai: exports "." объявлен
- * только как import), а драйверу маршрута нужен именно он.
- * @returns {string[]} абсолютные пути существующих каталогов node_modules.
- */
-function hostNodeModulesDirs() {
-  const dirs = []
-  for (const root of hostInstallRoots()) {
-    dirs.push(join(root, 'node_modules'))
-    dirs.push(join(root))
-  }
-  if (typeof process.argv[1] === 'string' && process.argv[1] !== '') {
-    dirs.push(join(dirname(process.argv[1]), 'node_modules'))
-    dirs.push(join(dirname(process.argv[1]), '..'))
-  }
-  return [...new Set(dirs)].filter((dir) => existsSync(dir))
-}
-
-/**
- * Собрать file:// URL модуля ESM-only пакета по его exports-карте (без createRequire).
- * @param {string} spec - имя пакета ('@scope/name').
- * @param {string} [subpath] - подпуть без './' ('api/openai-completions'); '' — корень пакета.
- * @returns {string} file:// URL точки входа.
- */
-function hostModuleUrl(spec, subpath = '') {
-  const wanted = subpath === '' ? '.' : './' + subpath
-  for (const dir of hostNodeModulesDirs()) {
-    const packageDir = join(dir, spec)
-    if (!existsSync(join(packageDir, 'package.json'))) continue
-    const pkg = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'))
-    const exportsMap = pkg.exports
-    let target = ''
-    if (typeof exportsMap === 'string') target = exportsMap
-    else if (exportsMap !== null && typeof exportsMap === 'object') {
-      const entry = exportsMap[wanted]
-      if (typeof entry === 'string') target = entry
-      else if (entry !== null && typeof entry === 'object') target = entry.import || entry.default || ''
-      if (target === '') {
-        for (const key of Object.keys(exportsMap)) {
-          if (!key.includes('*')) continue
-          const [prefix, suffix] = key.split('*')
-          if (!wanted.startsWith(prefix) || !wanted.endsWith(suffix)) continue
-          const middle = wanted.slice(prefix.length, wanted.length - suffix.length)
-          const value = exportsMap[key]
-          const pattern = typeof value === 'string' ? value : (value && (value.import || value.default)) || ''
-          if (pattern !== '') target = pattern.split('*').join(middle)
-          break
-        }
-      }
-    }
-    if (target === '' && wanted === '.') target = pkg.module || pkg.main || './index.js'
-    if (target === '') continue
-    return pathToFileURL(join(packageDir, target)).href
-  }
-  throw new Error('verme-gate: cannot locate ESM package "' + spec + (subpath === '' ? '' : '/' + subpath) + '" in host node_modules')
 }
 
 /** Диапазон DSH, на котором плагин проверен: ровно линия 0.2.1 (не 0.2.2-alpha — там не проверяли). */
@@ -2572,7 +2463,12 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
    * Провайдер с id llmProvider НЕ должен быть объявлен в патче профиля: два владельца одного
    * маршрута — конфликт регистрации (тогда пишем в журнал и остаёмся на чужих моделях).
    */
-  const gatewayRoute = { installed: false, handle: null, providerId: '' }
+  /**
+   * Маршрут моделей плагина. `error` — причина, по которой он не поднялся: поле уходит в
+   * /api/state (`models.route.error`), /api/diag и в configErrors, чтобы поломка была видна в UI
+   * без logFile (на Windows журнал по умолчанию не пишется, и молчаливый catch прятал её).
+   */
+  const gatewayRoute = { installed: false, handle: null, providerId: '', error: '', piAi: '' }
 
   const installGatewayRoute = async () => {
     if (gatewayRoute.installed) return
@@ -2587,13 +2483,15 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     }
     const llm = ctx.get('llm')
     if (llm === undefined || typeof llm.registerAdapter !== 'function') {
-      log('warn', 'ctx.llm.registerAdapter недоступен — свой маршрут моделей не поднят')
+      gatewayRoute.error = 'ctx.llm.registerAdapter недоступен: маршрут "' + providerId + '" не поднят'
+      log('warn', gatewayRoute.error)
       journal('ERROR no ctx.llm.registerAdapter')
       return
     }
     try {
       // pi-ai — ESM-only (exports "." без условия require), поэтому его резолвим сами.
-      const piAi = await import(hostModuleUrl('@earendil-works/pi-ai'))
+      gatewayRoute.piAi = hostModuleUrl('@earendil-works/pi-ai')
+      const piAi = await import(gatewayRoute.piAi)
       const dshPi = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-llm-pi-ai')).href)
       const dshLlm = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-llm')).href)
       const route = buildGatewayRoute({
@@ -2632,6 +2530,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       gatewayRoute.handle = llm.registerAdapter([providerId], route.adapter)
       gatewayRoute.installed = true
       gatewayRoute.providerId = providerId
+      gatewayRoute.error = ''
       ctx.effect(() => () => {
         try {
           if (gatewayRoute.handle !== null) gatewayRoute.handle()
@@ -2647,9 +2546,14 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       journal('models: own route "' + providerId + '" registered, api=openai-completions (каталог живой: getModels)')
     } catch (error) {
       const message = messageOf(error)
+      gatewayRoute.error = message
+      gatewayRoute.installed = false
+      gatewayRoute.providerId = ''
       log('warn', 'llm route "' + providerId + '": ' + message)
       journal('ERROR llm route "' + providerId + '": ' + message
         + ' (если провайдер объявлен в cordis.patch.yml — убери его оттуда: маршрутом владеет плагин)')
+      // Та же строка — в configErrors: её показывает UI, а журнал на Windows по умолчанию не пишется.
+      configErrors.push('маршрут моделей "' + providerId + '" не поднят: ' + message)
     }
   }
 
@@ -4334,6 +4238,9 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
           installed: gatewayRoute.installed,
           api: 'openai-completions',
           models: gatewayRoute.installed && modelState.known ? modelState.allowed.size : 0,
+          // Почему маршрута нет: пусто — всё поднялось; иначе текст причины (его же видно в configErrors).
+          error: gatewayRoute.error,
+          piAi: gatewayRoute.piAi,
         },
         current: currentSelection(),
       },
@@ -4419,6 +4326,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         installed: gatewayRoute.installed,
         api: 'openai-completions',
         models: gatewayRoute.installed && modelState.known ? modelState.allowed.size : 0,
+        error: gatewayRoute.error,
+        piAi: gatewayRoute.piAi,
       },
       keyState: modelState.keyState,
       keyRef: modelState.keyRef,
