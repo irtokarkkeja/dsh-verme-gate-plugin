@@ -56,13 +56,13 @@
 import { createRequire } from 'node:module'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
-import { readFile, readdir, mkdir, writeFile, rename, stat, appendFile, chmod } from 'node:fs/promises'
-import { existsSync, readFileSync } from 'node:fs'
+import { readFile, readdir, mkdir, writeFile, rename, stat, appendFile, chmod, rm, open } from 'node:fs/promises'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { join, dirname, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { applyRefWithLock } from './lib/credentials-emergency.js'
 import { validatePathValue } from './lib/paths.js'
-import { hostInstallRoots, findHostDshDir, hostModuleUrl } from './lib/host-packages.js'
+import { hostInstallRoots, findHostDshDir, hostModuleUrl, resolveHostPackage } from './lib/host-packages.js'
 
 const LOG_PREFIX = '[verme-gate]'
 /** POSIX-identifier credential-ref (копия REF_PATTERN, PKG/dsh-credentials/lib/index.js:13). */
@@ -101,7 +101,10 @@ const MAX_TMP_RENAME_ATTEMPTS = 5
  */
 function hostResolve(spec) {
   const bases = []
-  if (typeof process.argv[1] === 'string' && process.argv[1] !== '') bases.push(process.argv[1])
+  if (typeof process.argv[1] === 'string' && process.argv[1] !== '') {
+    try { bases.push(realpathSync(process.argv[1])) } catch { /* argv может быть синтетическим */ }
+    bases.push(process.argv[1])
+  }
   for (const root of hostInstallRoots()) bases.push(join(root, 'package.json'))
   const failures = []
   for (const base of bases) {
@@ -156,6 +159,11 @@ function detectDshRuntime() {
       return { version: '', dir: '' }
     }
   }
+  // CLI может быть symlink вне установки; сначала проверяем манифест реального пакета хоста.
+  try {
+    const cli = versionOf(hostPackageRoot(realpathSync(process.argv[1]), '@deepseek-ai/dsh'))
+    if (cli.version !== '') return cli
+  } catch { /* не CLI DSH — пробуем соседние пакеты */ }
   // 1. Обычный путь: пакет dsh резолвится как модуль.
   try {
     const direct = versionOf(hostPackageRoot(hostResolve('@deepseek-ai/dsh'), '@deepseek-ai/dsh'))
@@ -368,6 +376,8 @@ export const Config = z.object({
   llmBaseUrl: z.string().default('https://ai-labs-litellm.verme.ru/v1'),
   /** Сужать каталог до ответа /v1/models ключа (без отказа в request-path — 403 отдаёт шлюз). */
   modelSync: z.boolean().default(true),
+  /** Предпочтение для первого выбора/замены потерянной модели; не переопределяет доступный выбор пользователя. */
+  preferredModel: z.string().default('GeneralPurpose'),
   /**
    * Как часто перечитывать каталог моделей у шлюза, мс (0 — не перечитывать).
    * Права ключа меняются на шлюзе без нашего участия: без таймера селектор держит старый набор
@@ -1095,24 +1105,18 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
   const emergencyCredentialWrite = async (ref, value) => {
     const file = credentialsFile()
     try {
-      // atomic-write есть в поставке DSH; если в этой версии его нет — работаем без блокировки,
-      // но с перечитыванием файла перед записью (защита от гонки внутри applyRefWithLock).
+      // Без штатного lock не пишем: повторное чтение не заменяет межпроцессную блокировку.
       const atomic = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-atomic-write')).href)
-        .catch(() => undefined)
-      const withLock = atomic !== undefined && typeof atomic.withFileLock === 'function'
-        ? (operation) => atomic.withFileLock(file, operation)
-        : (operation) => operation()
-      const writeText = atomic !== undefined && typeof atomic.writeFileAtomic === 'function'
-        ? (text) => atomic.writeFileAtomic(file, text, { mode: 0o600 })
-        : async (text) => {
-          const tmp = file + '.tmp-restore-' + randomUUID()
-          await writeFile(tmp, text, { mode: 0o600 })
-          await rename(tmp, file)
-        }
+      if (!atomic || typeof atomic.withFileLock !== 'function' || typeof atomic.writeFileAtomic !== 'function') {
+        throw new Error('аварийное восстановление отложено: недоступен atomic-write с блокировкой')
+      }
       const result = await applyRefWithLock({
-        withLock,
-        readText: () => readFile(file, 'utf8').catch(() => ''),
-        writeText,
+        withLock: (operation) => atomic.withFileLock(file, operation),
+        readText: () => readFile(file, 'utf8').catch((error) => {
+          if (error.code === 'ENOENT') return ''
+          throw error
+        }),
+        writeText: (text) => atomic.writeFileAtomic(file, text, { mode: 0o600 }),
         parse: (text) => YAML.parse(text),
         stringify: (document) => YAML.stringify(document),
         ref,
@@ -2465,38 +2469,61 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
    */
   /**
    * Маршрут моделей плагина. `error` — причина, по которой он не поднялся: поле уходит в
-   * /api/state (`models.route.error`), /api/diag и в configErrors, чтобы поломка была видна в UI
+   * /api/state (`models.route.error`) и /api/diag, чтобы поломка была видна в UI
    * без logFile (на Windows журнал по умолчанию не пишется, и молчаливый catch прятал её).
    */
   const gatewayRoute = { installed: false, handle: null, providerId: '', error: '', piAi: '' }
 
   const installGatewayRoute = async () => {
-    if (gatewayRoute.installed) return
-    if (!modelSyncEnabled) {
-      journal('models: own route not installed (modelSync disabled: нужен llmProvider/llmSecretRef/llmBaseUrl)')
-      return
-    }
+    if (gatewayRoute.disposed || gatewayRoute.installed || !modelSyncEnabled) return
+    if (gatewayRoute.installing) return gatewayRoute.installing
     const providerId = String(cfg.llmProvider || '')
-    if (providerId === '') {
-      journal('models: own route not installed (llmProvider пуст)')
-      return
-    }
-    const llm = ctx.get('llm')
-    if (llm === undefined || typeof llm.registerAdapter !== 'function') {
-      gatewayRoute.error = 'ctx.llm.registerAdapter недоступен: маршрут "' + providerId + '" не поднят'
-      log('warn', gatewayRoute.error)
-      journal('ERROR no ctx.llm.registerAdapter')
-      return
-    }
-    try {
-      // pi-ai — ESM-only (exports "." без условия require), поэтому его резолвим сами.
-      gatewayRoute.piAi = hostModuleUrl('@earendil-works/pi-ai')
-      const piAi = await import(gatewayRoute.piAi)
-      const dshPi = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-llm-pi-ai')).href)
-      const dshLlm = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-llm')).href)
+    if (providerId === '') return
+    const operation = (async () => {
+      let release = null
+      let stopped = false
+      /** Снять только адаптер этой попытки; повторное освобождение безопасно. */
+      const cleanup = () => {
+        if (stopped) return
+        stopped = true
+        const owned = release
+        release = null
+        try {
+          if (owned) owned()
+        } catch (error) {
+          gatewayRoute.error = (gatewayRoute.error ? gatewayRoute.error + '; ' : '') + 'release llm route: ' + messageOf(error)
+          log('warn', gatewayRoute.error)
+        } finally {
+          if (gatewayRoute.handle === cleanup) {
+            gatewayRoute.handle = null
+            gatewayRoute.installed = false
+            gatewayRoute.providerId = ''
+          }
+        }
+      }
+      try {
+        const llm = ctx.get('llm')
+        if (!llm || typeof llm.registerAdapter !== 'function') throw new Error('ctx.llm.registerAdapter недоступен')
+        // Cleanup до первого await: выгрузка во время импорта отменяет попытку,
+        // а отказ ctx.effect не оставляет адаптер без владельца.
+        gatewayRoute.cancel = cleanup
+        if (!gatewayRoute.cleanupRegistered) {
+          ctx.effect(() => () => {
+            gatewayRoute.disposed = true
+            if (gatewayRoute.cancel) gatewayRoute.cancel()
+          }, 'verme-gate.gatewayRoute')
+          gatewayRoute.cleanupRegistered = true
+        }
+        if (stopped) return
+        const piPackage = resolveHostPackage('@earendil-works/pi-ai', '', { dshDir: dshRuntime.dir })
+        gatewayRoute.piAi = piPackage.entryUrl
+        const piAi = await import(gatewayRoute.piAi)
+        const dshPi = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-llm-pi-ai')).href)
+        const dshLlm = await import(pathToFileURL(hostResolve('@deepseek-ai/dsh-llm')).href)
+        if (stopped) return
       const route = buildGatewayRoute({
         piAi,
-        loadApi: () => import(hostModuleUrl('@earendil-works/pi-ai', 'api/openai-completions')),
+        loadApi: () => import(hostModuleUrl('@earendil-works/pi-ai', 'api/openai-completions', { packageDir: piPackage.packageDir })),
         dshPi,
         dshLlm,
         providerId,
@@ -2527,33 +2554,24 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         },
         log,
       })
-      gatewayRoute.handle = llm.registerAdapter([providerId], route.adapter)
-      gatewayRoute.installed = true
-      gatewayRoute.providerId = providerId
-      gatewayRoute.error = ''
-      ctx.effect(() => () => {
-        try {
-          if (gatewayRoute.handle !== null) gatewayRoute.handle()
-        } catch (error) {
-          log('warn', 'release llm route: ' + messageOf(error))
-        }
-        gatewayRoute.handle = null
-        gatewayRoute.installed = false
-        gatewayRoute.providerId = ''
-      }, 'verme-gate.gatewayRoute')
-      // Каталога на этом шаге ещё нет (discovery идёт ниже), поэтому размер не печатаем:
-      // живой список = права ключа, их пишет строка «key of token … allows N model(s)».
-      journal('models: own route "' + providerId + '" registered, api=openai-completions (каталог живой: getModels)')
-    } catch (error) {
-      const message = messageOf(error)
-      gatewayRoute.error = message
-      gatewayRoute.installed = false
-      gatewayRoute.providerId = ''
-      log('warn', 'llm route "' + providerId + '": ' + message)
-      journal('ERROR llm route "' + providerId + '": ' + message
-        + ' (если провайдер объявлен в cordis.patch.yml — убери его оттуда: маршрутом владеет плагин)')
-      // Та же строка — в configErrors: её показывает UI, а журнал на Windows по умолчанию не пишется.
-      configErrors.push('маршрут моделей "' + providerId + '" не поднят: ' + message)
+        if (stopped) return
+        release = llm.registerAdapter([providerId], route.adapter)
+        if (typeof release !== 'function') throw new Error('registerAdapter не вернул disposer')
+        gatewayRoute.handle = cleanup
+        gatewayRoute.providerId = providerId
+        gatewayRoute.installed = true
+        gatewayRoute.error = ''
+        journal('models: own route "' + providerId + '" registered, api=openai-completions (каталог живой: getModels)')
+      } catch (error) {
+        gatewayRoute.error = messageOf(error)
+        cleanup()
+        log('warn', 'llm route "' + providerId + '": ' + gatewayRoute.error)
+        journal('ERROR llm route "' + providerId + '": ' + gatewayRoute.error)
+      }
+    })()
+    gatewayRoute.installing = operation
+    try { await operation } finally {
+      if (gatewayRoute.installing === operation) gatewayRoute.installing = null
     }
   }
 
@@ -2632,7 +2650,21 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
    *   • событие всегда видно: журнал + modelState.defaultSwap в /api/state.
    */
   const ensureDefaultModel = async () => {
-    if (!modelState.known || modelState.provider === '' || modelState.allowed.size === 0) return
+    // Права ключа не означают, что адаптер уже зарегистрирован в DSH.
+    const ownProvider = modelState.provider === String(cfg.llmProvider || '')
+    let routeReady = gatewayRoute.installed && gatewayRoute.providerId === modelState.provider
+    if (!ownProvider && modelState.provider !== '') {
+      try {
+        const llm = ctx.get('llm')
+        routeReady = !!llm && typeof llm.listProviders === 'function'
+          && llm.listProviders().some((provider) => provider.id === modelState.provider)
+      } catch { routeReady = false }
+    }
+    if (!modelSyncEnabled || !routeReady || !modelState.known || modelState.provider === '' || modelState.allowed.size === 0) {
+      installDefaultSubstitute(null)
+      modelState.defaultSwap = null
+      return
+    }
     const service = ctx.get('agentDefaultModel')
     if (service === undefined || typeof service.currentSelection !== 'function') return
     const readBase = defaultGuard.base !== null ? () => defaultGuard.base.call(service) : () => service.currentSelection()
@@ -2649,7 +2681,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       modelState.defaultSwap = null
       return
     }
-    const first = [...modelState.allowed][0]
+    const preferred = typeof cfg.preferredModel === 'string' ? cfg.preferredModel : 'GeneralPurpose'
+    const first = preferred !== '' && modelState.allowed.has(preferred) ? preferred : [...modelState.allowed][0]
     if (first === undefined) return
     const from = current ? current.provider + '/' + current.model : 'unset'
     const to = modelState.provider + '/' + first
@@ -2719,6 +2752,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       journal('models: sync disabled (provider=' + modelState.provider + ' secret=' + String(cfg.llmSecretRef || '') + ')')
       return
     }
+    await installGatewayRoute()
     if (token === undefined) {
       // активного токена нет (удалили последний): доступа нет и ключ провайдера не держим
       modelState.keyState = 'no-token'
@@ -3372,20 +3406,34 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     if (stateFile === '') return
     await mkdir(dirname(stateFile), { recursive: true })
     const payload = JSON.stringify(stateDoc(), null, 2) + '\n'
-    let lastError
-    for (let attempt = 0; attempt < MAX_TMP_RENAME_ATTEMPTS; attempt += 1) {
-      const tmp = stateFile + '.tmp-' + process.pid + '-' + randomUUID()
+    const tmp = stateFile + '.tmp-' + process.pid + '-' + randomUUID()
+    let ownsTemp = false
+    try {
+      const handle = await open(tmp, 'wx', 0o600)
+      ownsTemp = true
       try {
-        await writeFile(tmp, payload, { mode: 0o600 })
-        await rename(tmp, stateFile)
-        return
-      } catch (error) {
-        lastError = error
-        await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)))
+        await handle.writeFile(payload)
+      } finally {
+        // Windows не позволит заменить открытый файл: закрываем до rename.
+        await handle.close()
       }
+      for (let attempt = 0; attempt < MAX_TMP_RENAME_ATTEMPTS; attempt += 1) {
+        try {
+          await rename(tmp, stateFile)
+          return
+        } catch (error) {
+          if (!['EBUSY', 'EPERM', 'EACCES'].includes(error.code) || attempt + 1 === MAX_TMP_RENAME_ATTEMPTS) throw error
+          await new Promise((resolve) => setTimeout(resolve, Math.min(20 * (2 ** attempt), 200)))
+        }
+      }
+    } catch (error) {
+      journal('ERROR saveState: ' + (error.code || 'write failed'))
+      throw error
+    } finally {
+      if (ownsTemp) await rm(tmp, { force: true }).catch((error) => {
+        journal('ERROR cleanup state tmp: ' + (error.code || 'cleanup failed'))
+      })
     }
-    journal('ERROR saveState: ' + messageOf(lastError))
-    throw lastError
   }
 
   /**

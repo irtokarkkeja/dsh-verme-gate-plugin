@@ -501,6 +501,13 @@ try {
     fileURLToPath(new URL('test/credentials-race.test.mjs', here)),
     fileURLToPath(new URL('test/paths.test.mjs', here)),
     fileURLToPath(new URL('test/host-packages.test.mjs', here)),
+    fileURLToPath(new URL('test/model-selection.test.mjs', here)),
+    fileURLToPath(new URL('test/host-resolution-hardening.test.mjs', here)),
+    fileURLToPath(new URL('test/gateway-route-lifecycle.test.mjs', here)),
+    fileURLToPath(new URL('test/state-write.test.mjs', here)),
+    fileURLToPath(new URL('test/credentials-io.test.mjs', here)),
+    fileURLToPath(new URL('test/host-anchor.test.mjs', here)),
+    fileURLToPath(new URL('test/route-diagnostics.test.mjs', here)),
   ]
   const missing = testFiles.filter((path) => !existsSync(path))
   if (missing.length > 0) throw new Error('тесты не приехали в пакет: ' + missing.join(', ')

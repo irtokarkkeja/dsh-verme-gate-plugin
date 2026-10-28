@@ -198,6 +198,7 @@ function banner() {
     items.push('<div class="b-item b-warn">применение токена в работе: MCP-тулзы временно запрещены всем агентам (fail-closed)</div>');
   }
   const models = state.models || {};
+  if (models.route && models.route.error) items.push('<div class="b-item b-bad">модели шлюза не подключены: ' + esc(models.route.error) + '</div>');
   if (models.keyState === 'config-invalid') items.push('<div class="b-item b-bad">' + esc(models.error) + '</div>');
   else if (models.keyState === 'error' || models.keyState === 'no-key') items.push('<div class="b-item b-warn">модели: ' + esc(models.error) + '</div>');
   if (models.degraded) items.push('<div class="b-item b-warn">models[] токена не пересекается с правами ключа — каталог развёрнут до прав ключа</div>');
