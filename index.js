@@ -387,7 +387,7 @@ export const Config = z.object({
   /**
    * Ручные ёмкости моделей поверх ответа шлюза: id → {contextWindow?, maxTokens?}.
    * Шлюз отдаёт max_input_tokens/max_output_tokens не для всех моделей; без этой карты остальным
-   * достаётся дефолт 131072, и автокомпакт срабатывает раньше реального окна.
+   * достаётся запасное окно 327680; точные значения можно переопределить этой картой.
    */
   modelLimits: z.dict(z.object({
     contextWindow: z.number(),
@@ -405,7 +405,7 @@ export const Config = z.object({
    * «на каком объёме компактить»: DSH считает порог как min(0.8·окно, окно − вывод − headroom),
    * поэтому 131072 даёт компакт на 65536, а 327680 — ровно на 262144 (0.8·327680).
    */
-  defaultContextWindow: z.number().step(1).default(131072),
+  defaultContextWindow: z.number().step(1).default(327680),
   /** Вывод, объявляемый такой модели (просьба к модели, не резерв порога). */
   defaultMaxTokens: z.number().step(1).default(32768),
   /**
@@ -2394,7 +2394,7 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       const ids = entries.map((entry) => entry.id)
       /**
        * Ёмкости, которые шлюз сообщает не для всех моделей (на 2026-10-27 — у 6 из 46).
-       * Без них модель объявляется с дефолтами 131072/32768, и автокомпакт режет длинные
+       * Без них модель объявляется с дефолтами 327680/32768, и автокомпакт режет длинные
        * сессии раньше времени (у deepseek-v4-pro шлюз отдаёт 1000000/393216).
        */
       const limits = new Map()

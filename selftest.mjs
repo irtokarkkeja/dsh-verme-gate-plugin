@@ -508,6 +508,7 @@ try {
     fileURLToPath(new URL('test/credentials-io.test.mjs', here)),
     fileURLToPath(new URL('test/host-anchor.test.mjs', here)),
     fileURLToPath(new URL('test/route-diagnostics.test.mjs', here)),
+    fileURLToPath(new URL('test/fallback-context.test.mjs', here)),
   ]
   const missing = testFiles.filter((path) => !existsSync(path))
   if (missing.length > 0) throw new Error('тесты не приехали в пакет: ' + missing.join(', ')

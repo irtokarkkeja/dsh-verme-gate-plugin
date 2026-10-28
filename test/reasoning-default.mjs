@@ -70,7 +70,7 @@ const route = buildGatewayRoute({
 })
 const profile = captured.adapterOptions.profiles().get('dshlab')
 assert.equal(profile.api, GATEWAY_API)
-assert.equal(profile.defaultContextWindow, 131072)
+assert.equal(profile.defaultContextWindow, 327680)
 assert.equal(profile.defaultMaxTokens, 32768)
 assert.equal(profile.configuredMaxTokens.get('GeneralPurpose'), 32768)
 const described = route.describe()
