@@ -38,6 +38,7 @@ function parseArgs(argv) {
     else if (arg === '-m' || arg === '--message') options.message = argv[++index] || ''
     else if (arg === '--yes') options.yes = true
     else if (arg === '--no-mirror') options.mirror = false
+    else if (arg === '--publish-only') { /* легаси-флаг из старой подсказки: сейчас no-op */ }
     else if (arg === '-h' || arg === '--help') options.help = true
     else throw new Error('неизвестный аргумент: ' + arg)
   }
@@ -76,7 +77,7 @@ const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
 const next = options.set !== '' ? options.set : bumped(manifest.version, options.bump)
 const message = options.message.trim()
 if (message === '') throw new Error('нужно -m "что изменилось" — сообщение уходит и в коммит, и в тег')
-if (next === manifest.version) throw new Error('версия не меняется: ' + next)
+if (next === manifest.version && options.set === '') throw new Error('версия не меняется: ' + next)
 
 process.stdout.write('verme-gate ' + manifest.version + ' → ' + next + '\n')
 manifest.version = next

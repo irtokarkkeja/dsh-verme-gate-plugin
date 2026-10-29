@@ -54,6 +54,7 @@
  */
 
 import { createRequire } from 'node:module'
+import { spawn } from 'node:child_process'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile, readdir, mkdir, writeFile, rename, stat, appendFile, chmod, rm, open } from 'node:fs/promises'
@@ -63,6 +64,7 @@ import { homedir } from 'node:os'
 import { applyRefWithLock } from './lib/credentials-emergency.js'
 import { validatePathValue } from './lib/paths.js'
 import { hostInstallRoots, findHostDshDir, hostModuleUrl, resolveHostPackage } from './lib/host-packages.js'
+import { SsoConnector } from './lib/sso.js'
 
 const LOG_PREFIX = '[verme-gate]'
 /** POSIX-identifier credential-ref (копия REF_PATTERN, PKG/dsh-credentials/lib/index.js:13). */
@@ -361,6 +363,12 @@ export const Config = z.object({
   /** База шлюза для MCP: <gatewayBaseUrl>/<server>/mcp и <gatewayBaseUrl>/v1/... */
   gatewayBaseUrl: z.string().default('https://ai-labs-litellm.verme.ru'),
   /**
+   * База SSO-автоподключения (POST /connect/start, POST /connect/poll): она выдаёт ключ LiteLLM
+   * после входа в браузере, чтобы человеку не копировать ключ руками. '' — способ выключен:
+   * кнопка «Войти через SSO» не показывается, маршруты отвечают «SSO не настроен».
+   */
+  ssoUrl: z.string().default('https://ai-labs.verme.ru/dsh-verme-gate'),
+  /**
    * Id маршрута моделей. Плагин ВЛАДЕЕТ им: объявляет провайдера сам (createProvider +
    * PiAiAdapter + ctx.llm.registerAdapter), поэтому каталог в селекторе = права активного ключа,
    * без пересборки бандла. Провайдер с этим id НЕ должен быть объявлен в cordis.patch.yml;
@@ -493,6 +501,39 @@ function publicToolName(serverName, rawName) {
   if (normalized === joined && normalized.length <= MAX_PUBLIC_NAME_LENGTH) return normalized
   const hash = createHash('sha256').update(serverName + '\u0000' + rawName).digest('hex').slice(0, HASH_LENGTH)
   return normalized.slice(0, MAX_PUBLIC_NAME_LENGTH - HASH_LENGTH - 1) + '_' + hash
+}
+
+/**
+ * Открыть страницу входа в браузере ХОСТА — best effort.
+ *
+ * DSH может работать на сервере, а человек смотреть экран из своего браузера: тогда открыть
+ * нечего, и это не ошибка входа — страница всё равно есть в status() и открывается ссылкой
+ * в диалоге. Поэтому провал открытия только журналируется, поток входа не рвётся.
+ *
+ * @param {string} url - абсолютный http(s)-адрес страницы входа.
+ * @returns {Promise<boolean>} true — процесс-открыватель запущен.
+ */
+function openInHostBrowser(url) {
+  return new Promise((resolve) => {
+    // Адрес приходит от SSO-сервера: открываем только http(s), иначе это запуск чужой команды.
+    if (!/^https?:\/\//i.test(String(url))) return resolve(false)
+    const command = process.platform === 'darwin' ? 'open' : (process.platform === 'win32' ? 'cmd' : 'xdg-open')
+    // cmd.exe разбирает свою командную строку сам, а Node квотирует аргумент только при пробелах
+    // и кавычках: '&' в адресе стал бы разделителем команд (инъекция). Такой адрес не открываем —
+    // ссылка остаётся в диалоге, человек нажмёт её сам.
+    if (process.platform === 'win32' && /[&|<>^%"]/.test(String(url))) return resolve(false)
+    const args = process.platform === 'win32' ? ['/c', 'start', '', String(url)] : [String(url)]
+    try {
+      const child = spawn(command, args, { detached: true, stdio: 'ignore' })
+      child.once('error', () => resolve(false))
+      child.once('spawn', () => {
+        child.unref()
+        resolve(true)
+      })
+    } catch {
+      resolve(false)
+    }
+  })
 }
 
 /**
@@ -663,6 +704,16 @@ export function apply(ctx, config) {
       + ' (нижний регистр, дефисы), без "/" и без пересечения с /api и статикой клиента — страница и API не подняты')
   } else {
     pagePath = rawPagePath
+  }
+  /**
+   * SSO-автоподключение: база без хвостового "/" и признак «включено». Пустая строка — способ
+   * выключен (изолированный стенд без SSO), мусор в адресе — предупреждение, а не отказ экрана:
+   * ручное подключение ключом обязано работать и без SSO.
+   */
+  const ssoBase = String(cfg.ssoUrl || '').trim().replace(/\/+$/, '')
+  const ssoEnabled = /^https?:\/\//i.test(ssoBase)
+  if (ssoBase !== '' && !ssoEnabled) {
+    configWarnings.push('ssoUrl "' + ssoBase + '" не похож на http(s)-адрес: SSO выключен, доступ — ключом')
   }
 
   /**
@@ -1327,11 +1378,13 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
    * ТОЛЬКО разрешённые ключу серверы (без master-key), поля env_vars/static_headers при этом null.
    * Дубликаты server_name не «last-wins»: группы объединяются, факт пишется в диагностику (ревью F8).
    * @param {string} key - LiteLLM-ключ активного токена.
-   * @returns {Promise<{servers?: object[], duplicates?: string[], error?: string}>} список либо ошибка.
+   * @returns {Promise<{servers?: object[], duplicates?: string[], error?: string, status?: number}>}
+   *   список либо ошибка; status — HTTP-код шлюза, когда он его дал (401 и 503 требуют разной реакции).
    */
   const discoverRegistry = async (key) => {
     const answer = await gatewayGet('/v1/mcp/server', key)
-    if (answer.error !== undefined) return { error: answer.error }
+    // Код ответа важен вызывающему: 401/403 — ключ не принят навсегда, 5xx/429 — шлюз моргнул.
+    if (answer.error !== undefined) return { error: answer.error, status: answer.status }
     const body = answer.body
     const list = Array.isArray(body) ? body : (Array.isArray(body && body.servers) ? body.servers : [])
     const byName = new Map()
@@ -3220,12 +3273,22 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     // R1: сначала барьер deny-all, только потом смена activeToken — иначе diag врёт парой
     // «новый токен + старый allowlist» (в окно попадал ещё и await saveActiveToken).
     if (nextTokenId !== undefined && nextTokenId !== state.activeToken) {
-      state.activeToken = nextTokenId
       try {
-        await saveActiveToken(nextTokenId)
+        await commitActiveToken(nextTokenId)
       } catch (error) {
+        // Без durable-переключения «подключено» было бы правдой только в памяти: возвращаем
+        // прежний активный токен, снимаем барьер и отдаём отказ наверх — экран скажет правду.
         state.lastError = 'saveActiveToken: ' + messageOf(error)
         journal('ERROR ' + state.lastError)
+        if (targeted === undefined) {
+          state.barrier = false
+          settlePhase()
+          applyAgentGates()
+        }
+        throw Object.assign(
+          new Error('не удалось переключить активный токен: ' + messageOf(error)),
+          { retryable: true, code: error && error.code },
+        )
       }
     }
     if (targeted === undefined) {
@@ -3348,7 +3411,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       keyRef,
       models: [],
       group: '',
-      source: 'ui',
+      // Происхождение переживает рестарт: SSO-токен не должен выглядеть как вставленный руками.
+      source: raw.source === 'sso' ? 'sso' : 'ui',
     }
   }
 
@@ -3391,6 +3455,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
         server: entry[0],
         tools: entry[1].all ? [] : [...entry[1].tools],
       })),
+      // Метка 'ui' | 'sso': по ней экран и журнал отличают ключ из SSO от вставленного руками.
+      source: token.source === 'sso' ? 'sso' : 'ui',
     })),
     hiddenTokens: [...hiddenTokens],
     // Состав серверов переживает рестарт: без активного токена экран всё равно показывает строки с причиной.
@@ -3443,6 +3509,26 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
   const saveActiveToken = async (tokenId) => {
     state.activeToken = tokenId
     await saveStateDoc()
+  }
+
+  /**
+   * Переключить активный токен и персист; при сбое записи активный остаётся прежним.
+   *
+   * Раньше ошибка saveActiveToken только журналировалась, а state.activeToken уже был новым:
+   * экран показывал «подключено», хотя после рестарта доступ откатился бы к старому ключу.
+   * Агентам при этом нужен рабочий доступ, поэтому прежний активный токен сохраняется.
+   * @param {string} tokenId - новый активный токен.
+   * @returns {Promise<void>} завершение записи; отказ пробрасывается наверх.
+   */
+  const commitActiveToken = async (tokenId) => {
+    const previous = state.activeToken
+    state.activeToken = tokenId
+    try {
+      await saveActiveToken(tokenId)
+    } catch (error) {
+      state.activeToken = previous
+      throw error
+    }
   }
 
   /* ─────────────────────── M4: страница и HTTP API ─────────────────────── */
@@ -4197,6 +4283,11 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       generation: state.generation,
       page: pagePath,
       /**
+       * Включён ли вход через SSO (ssoUrl) и не идёт ли он открытым текстом: экран по этим флагам
+       * показывает второй способ и предупреждает, что по http код и ключ видны в сети (стенд).
+       */
+      sso: { enabled: ssoEnabled, url: ssoBase, insecure: ssoEnabled && !/^https:/i.test(ssoBase) },
+      /**
        * Сборка DSH, в которой работает плагин, и вердикт совместимости: у строки патча с абсолютным
        * путём гейт engines.dsh не применяется, поэтому правду об этом знает только сам плагин.
        */
@@ -4675,7 +4766,8 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
    * Проверить ключ LiteLLM, ничего не сохраняя: что шлюз разрешает этому ключу.
    * Ключ нигде не пишется и не журналируется — только счётчики.
    * @param {unknown} rawKey - вставленный ключ.
-   * @returns {Promise<{servers?: object[], models?: string[], modelsError?: string, error?: string}>} права ключа либо ошибка.
+   * @returns {Promise<{servers?: object[], models?: string[], modelsError?: string, error?: string, retryable?: boolean}>}
+   *   права ключа либо ошибка; retryable — отказ временный (сеть, 5xx, 429).
    */
   const probeKey = async (rawKey) => {
     const key = String(rawKey || '').trim()
@@ -4683,7 +4775,12 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     if (key.length > 200 || /\s/.test(key)) return { error: 'это не похоже на ключ LiteLLM: в ключе нет пробелов и переводов строк' }
     const registry = await discoverRegistry(key)
     if (registry.error !== undefined) {
-      return { error: 'шлюз не принял ключ (' + registry.error + '): проверьте, что это ключ LiteLLM этого шлюза и он не отозван' }
+      // 401/403 — ключ не принят навсегда; сети/5xx/429 — шлюз моргнул, такой ключ стоит повторить.
+      const status = Number(registry.status || 0)
+      return {
+        error: 'шлюз не принял ключ (' + registry.error + '): проверьте, что это ключ LiteLLM этого шлюза и он не отозван',
+        retryable: status === 0 || status === 429 || status >= 500,
+      }
     }
     const discovery = await discoverModels(key)
     return {
@@ -4710,6 +4807,80 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
   }
 
   /**
+   * Сохранить LiteLLM-ключ как токен доступа: общий путь ручного подключения и SSO.
+   *
+   * Ключ проверяется шлюзом ДО записи (probeKey): мусор в поле «ключ» иначе сохраняется как
+   * «ключ задан», discovery падает, а экран одновременно показывает зелёный ключ и degraded.
+   * Тот же ключ переиспользует уже сохранённый токен — второй токен тому же ключу не нужен.
+   * Включение доступа (applyActiveToken) тоже здесь: у ручного подключения есть выбор «сделать
+   * активным сразу», у SSO выбора нет, но порядок «сохранили -> включили» обязан быть один.
+   *
+   * @param {unknown} rawKey - вставленный человеком или выданный SSO ключ.
+   * @param {{label?: string, source?: string, activate?: boolean}} options - название токена
+   *   (по умолчанию «Ключ …<хвост>»), метка происхождения ('ui' | 'sso') и включать ли сразу.
+   * @returns {Promise<{token?: object, reused?: boolean, probe?: object, error?: string}>} токен,
+   *   признак переиспользования и права ключа из шлюза; error — ключ не принят (не сохранён).
+   */
+  const saveKeyAsToken = async (rawKey, options) => {
+    const settings = options !== null && options !== undefined ? options : {}
+    const probe = await probeKey(rawKey)
+    if (probe.error !== undefined) return { error: probe.error, retryable: probe.retryable === true }
+    const key = String(rawKey).trim()
+    const given = String(settings.label || '').trim()
+    const source = typeof settings.source === 'string' && settings.source !== '' ? settings.source : 'ui'
+    // Тот же ключ уже сохранён у токена экрана — не плодим второй, просто включаем доступ.
+    for (const known of uiTokens.values()) {
+      const stored = await readSecret(known.keyRef)
+      if (stored === '' || stored !== key) continue
+      if (settings.activate !== false) {
+        await applyActiveToken('token-connect-reuse:' + known.id, known.id)
+      }
+      journal('token connected (reuse) token=' + known.id + ' servers(allowed by key)=' + probe.servers.length
+        + ' models=' + probe.models.length + ' ref=' + known.keyRef)
+      return { token: known, reused: true, probe }
+    }
+    // Переводы строк в названии сломали бы формат строки журнала: имя приходит и от SSO-сервера.
+    const label = (given !== '' ? given : 'Ключ …' + key.slice(-4)).replace(/[\r\n]+/g, ' ').slice(0, 80)
+    let id = slugTokenId(label)
+    if (!TOKEN_ID_PATTERN.test(id)) id = 'key-' + Date.now().toString(36)
+    id = uniqueTokenId(id)
+    const token = {
+      id,
+      label,
+      servers: new Map(),
+      keyRef: tokenKeyRef(id),
+      models: [],
+      group: '',
+      source,
+    }
+    await ctx.credentials.set(credentialRef(token.keyRef), key)
+    uiTokens.set(id, token)
+    catalog.tokens.set(id, token)
+    try {
+      await saveStateDoc()
+    } catch (error) {
+      // Токен, не попавший в stateFile, исчезнет после рестарта: экран показал бы «подключено»,
+      // а в следующий раз человек снова видел бы «ключа нет». Откатываем и память, и секрет —
+      // тогда повтор создаёт токен заново, вместо того чтобы переиспользовать фантом.
+      uiTokens.delete(id)
+      catalog.tokens.delete(id)
+      try {
+        await ctx.credentials.unset(credentialRef(token.keyRef))
+      } catch (cleanupError) {
+        journal('WARN не удалось убрать секрет несохранённого токена: ' + messageOf(cleanupError))
+      }
+      throw Object.assign(
+        new Error('не удалось сохранить токен: ' + messageOf(error)),
+        { retryable: true, code: error && error.code },
+      )
+    }
+    journal('token connected token=' + id + ' label=' + label + ' servers(allowed by key)=' + probe.servers.length
+      + ' models=' + probe.models.length + ' ref=' + token.keyRef)
+    if (settings.activate !== false) await applyActiveToken('token-connect:' + id, id)
+    return { token, reused: false, probe }
+  }
+
+  /**
    * POST /api/token-connect: один шаг — вставили ключ, токен создан, ключ записан, токен активен.
    * Название необязательно: по умолчанию «Ключ …<хвост ключа>».
    */
@@ -4717,46 +4888,17 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     const body = await readJsonBody(req, res)
     if (body === null) return
     try {
-      const probe = await probeKey(body.key)
-      if (probe.error !== undefined) return json(res, 400, { error: probe.error })
-      const key = String(body.key).trim()
-      const given = String(body.label || '').trim()
-      // Тот же ключ уже сохранён у токена экрана — не плодим второй, просто включаем доступ.
-      for (const known of uiTokens.values()) {
-        const stored = await readSecret(known.keyRef)
-        if (stored === '' || stored !== key) continue
-        if (body.activate !== false) {
-          await applyActiveToken('token-connect-reuse:' + known.id, known.id)
-        }
-        journal('token connected (reuse) token=' + known.id + ' servers(allowed by key)=' + probe.servers.length
-          + ' models=' + probe.models.length + ' ref=' + known.keyRef)
-        return json(res, 200, Object.assign(
-          { ok: true, tokenId: known.id, reused: true, probe: { servers: probe.servers, models: probe.models } },
-          await describeState(),
-        ))
-      }
-      const label = (given !== '' ? given : 'Ключ …' + key.slice(-4)).slice(0, 80)
-      let id = slugTokenId(label)
-      if (!TOKEN_ID_PATTERN.test(id)) id = 'key-' + Date.now().toString(36)
-      id = uniqueTokenId(id)
-      const token = {
-        id,
-        label,
-        servers: new Map(),
-        keyRef: tokenKeyRef(id),
-        models: [],
-        group: '',
+      const saved = await saveKeyAsToken(body.key, {
+        label: body.label,
         source: 'ui',
-      }
-      await ctx.credentials.set(credentialRef(token.keyRef), key)
-      uiTokens.set(id, token)
-      catalog.tokens.set(id, token)
-      await saveStateDoc()
-      journal('token connected token=' + id + ' label=' + label + ' servers(allowed by key)=' + probe.servers.length
-        + ' models=' + probe.models.length + ' ref=' + token.keyRef)
-      if (body.activate !== false) await applyActiveToken('token-connect:' + id, id)
+        activate: body.activate !== false,
+      })
+      if (saved.error !== undefined) return json(res, 400, { error: saved.error })
+      const probe = { servers: saved.probe.servers, models: saved.probe.models }
       return json(res, 200, Object.assign(
-        { ok: true, tokenId: id, probe: { servers: probe.servers, models: probe.models } },
+        saved.reused === true
+          ? { ok: true, tokenId: saved.token.id, reused: true, probe }
+          : { ok: true, tokenId: saved.token.id, probe },
         await describeState(),
       ))
     } catch (error) {
@@ -4893,6 +5035,45 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
     }
   }
 
+  /* ─────────────────────── SSO: автоподключение ключом провайдера ─────────────────────── */
+
+  /**
+   * Коннектор входа: сеть, часы и браузер — его инъекции, ключ уходит прямо в saveKeyAsToken и
+   * дальше нигде не хранится. onError только журналируется: экран узнаёт причину из status().
+   */
+  const ssoConnector = new SsoConnector({
+    gateUrl: ssoBase,
+    openUrl: async (url) => {
+      const opened = await openInHostBrowser(url)
+      if (opened) return
+      // Коннектор считает вызов успешным, если он не бросил: молча проглоченный false превращался
+      // в ложное «Браузер открыт: войдите в ADFS». Бросаем — экран честно покажет ссылку.
+      throw new Error('браузер хоста не открылся')
+    },
+    onResult: async ({ key, email }) => {
+      let saved
+      try {
+        saved = await saveKeyAsToken(key, { label: 'SSO ' + email, source: 'sso' })
+      } catch (error) {
+        // Сбой записи (stateFile, хранилище ключей) временный: коннектор повторит ограниченно.
+        throw Object.assign(new Error(messageOf(error)), { retryable: error.retryable !== false, code: error.code })
+      }
+      if (saved.error !== undefined) {
+        // Ключ не принят шлюзом — окончательно: повторять его бессмысленно.
+        throw Object.assign(new Error(saved.error), { retryable: saved.retryable === true })
+      }
+      // Email не журналируем: он и так в названии токена, а журнал — не место для PII.
+      journal('sso connected token=' + saved.token.id + ' reused=' + String(saved.reused === true)
+        + ' servers(allowed by key)=' + saved.probe.servers.length + ' models=' + saved.probe.models.length)
+    },
+    onError: ({ error }) => {
+      journal('sso failed: ' + sanitizeUpstream(error).slice(0, 160))
+    },
+    log: (level, message) => {
+      journal('sso ' + level + ': ' + sanitizeUpstream(message).slice(0, 160))
+    },
+  })
+
   const routes = []
   /**
    * Зарегистрировать exact-route с периметром auth и проверкой метода.
@@ -4978,7 +5159,40 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
   register(pagePath + '/api/token-add', 'POST', handleTokenAdd)
     register(pagePath + '/api/token-remove', 'POST', handleTokenRemove)
     register(pagePath + '/api/token-restore', 'POST', handleTokenRestore)
+    /**
+     * POST /api/sso-start: начать вход. Отвечает сразу после обмена /connect/start (state waiting +
+     * loginUrl) — экран показывает ссылку, пока браузер и человек подтверждают вход; дальше опрос
+     * идёт в коннекторе, а экран спрашивает /api/sso-status. Повторный вызов во время ожидания
+     * второй поток не заводит.
+     */
+    register(pagePath + '/api/sso-start', 'POST', async (req, res) => {
+      if (await readJsonBody(req, res) === null) return
+      if (!ssoEnabled) return json(res, 400, { error: 'SSO не настроен: ssoUrl пуст или не http(s)-адрес' })
+      const status = await ssoConnector.start()
+      return json(res, 200, {
+        state: status.state,
+        loginUrl: status.loginUrl,
+        email: status.email,
+        error: status.error,
+        browserOpened: status.browserOpened,
+        // Код не секрет: его вводит человек на странице входа, и без него поток не подтвердится.
+        userCode: status.userCode,
+      })
+    })
+    /** GET /api/sso-status: снимок входа без ключа (ключ в status не попадает никогда). */
+    register(pagePath + '/api/sso-status', 'GET', async (req, res) => json(res, 200, ssoConnector.status()))
+    /**
+     * POST /api/sso-cancel: человек закрыл окно. Гасим заявку на шлюзе (иначе брошенная ссылка
+     * ещё 15 минут выпускает ключ, который никто не заберёт), затем снимаем локальное ожидание.
+     */
+    register(pagePath + '/api/sso-cancel', 'POST', async (req, res) => {
+      if (await readJsonBody(req, res) === null) return
+      await ssoConnector.cancel()
+      return json(res, 200, { state: ssoConnector.status().state })
+    })
     ctx.effect(() => () => {
+      // Выгрузка плагина: ожидание входа не должно переживать его (таймер и запрос снимаются).
+      ssoConnector.stop()
       for (const disposer of routes) {
         try {
           disposer()

@@ -121,7 +121,10 @@ check('P1-1: мутации отвечают ok=true', (source.match(/Object\.as
 check('R1: барьер до смены activeToken (токен применяется внутри очереди)',
   source.includes("applyActiveToken('token-switch:' + tokenId, tokenId)")
   && source.includes('const applyNow = async (reason, nextTokenId, only)')
-  && source.includes('state.activeToken = nextTokenId'))
+  && source.includes('await commitActiveToken(nextTokenId)')
+  && source.includes('const commitActiveToken = async (tokenId)')
+  && source.includes('state.activeToken = previous')
+  && source.indexOf('state.barrier = true') < source.indexOf('await commitActiveToken(nextTokenId)'))
 check('R2: durable-снимок ref-а в credential-store, а не только в памяти',
   source.includes("const SNAPSHOT_SUFFIX = '_SNAPSHOT'")
   && source.includes('SNAPSHOT_UNKNOWN') && source.includes('snapshotRefOf')
@@ -182,6 +185,19 @@ check('FR-016: подключение ключом одной ручкой (POST
   source.includes('const handleTokenConnect') && source.includes("register(pagePath + '/api/token-connect', 'POST', handleTokenConnect)"))
 check('FR-017: тот же ключ переиспользует подключение, а не плодит токены',
   source.includes("applyActiveToken('token-connect-reuse:' + known.id, known.id)"))
+check('SSO: вход вынесен в lib/sso.js и подключён маршрутами sso-start/sso-status',
+  source.includes("import { SsoConnector } from './lib/sso.js'")
+  && source.includes('new SsoConnector(')
+  && source.includes("register(pagePath + '/api/sso-start', 'POST'")
+  && source.includes("register(pagePath + '/api/sso-status', 'GET'"))
+check('SSO: пустой ssoUrl выключает вход, по умолчанию — прод-шлюз',
+  source.includes("ssoUrl: z.string().default('https://ai-labs.verme.ru/dsh-verme-gate')")
+  && source.includes('const ssoEnabled = '))
+check('SSO: выданный ключ сохраняется тем же путём, что и вставленный руками',
+  source.includes('const saveKeyAsToken = async (rawKey, options)')
+  && source.includes('saveKeyAsToken(body.key, {')
+  && source.includes("label: 'SSO ' + email, source: 'sso'"))
+check('SSO: ожидание входа снимается при выгрузке плагина', source.includes('ssoConnector.stop()'))
 check('FR-017: отключение доступа без удаления ключа (POST /api/disconnect)',
   source.includes('const handleDisconnect') && source.includes("register(pagePath + '/api/disconnect', 'POST', handleDisconnect)")
   && source.includes("await applyActiveToken('disconnect:' + previous, '')"))
@@ -206,6 +222,20 @@ check('FR-015: токены переключаются и удаляются и�
 check('FR-017: кнопки подключения — ключ или SSO, замена ключа и отключение',
   client.includes('Подключить по ключу') && client.includes('Войти через SSO')
   && client.includes('Заменить ключ') && client.includes("'/disconnect'"))
+check('FR-017: SSO-диалог ведёт вход и показывает ожидание/успех/ошибку',
+  client.includes("'/sso-start'") && client.includes("'/sso-status'")
+  && client.includes('Браузер открыт: войдите в ADFS')
+  && client.includes('Открыть страницу входа')
+  && client.includes('Ключ подключён, доступ включён'))
+check('B2: код подтверждения виден человеку крупно, а поток можно отменить',
+  client.includes('Код для страницы подтверждения')
+  && client.includes('status.userCode')
+  && client.includes("'/sso-cancel'"))
+check('SSO: на Windows адрес со спецсимволами cmd.exe не открывается (инъекция)',
+  source.includes("process.platform === 'win32' && /[&|<>^%\"]/.test(String(url))"))
+check('SSO: экран предупреждает, что шлюз без TLS (код и ключ открытым текстом)',
+  source.includes('insecure: ssoEnabled && !/^https:/i.test(ssoBase)')
+  && client.includes('Шлюз входа без TLS'))
 check('FR-017: удаление подключения вынесено в «Дополнительно»',
   client.includes("h(RemoveTokenDialog") && client.includes('Удалить токен и ключ'))
 check('FR-017d: длинный список моделей не растягивает экран',
@@ -509,6 +539,7 @@ try {
     fileURLToPath(new URL('test/host-anchor.test.mjs', here)),
     fileURLToPath(new URL('test/route-diagnostics.test.mjs', here)),
     fileURLToPath(new URL('test/fallback-context.test.mjs', here)),
+    fileURLToPath(new URL('test/sso.test.mjs', here)),
   ]
   const missing = testFiles.filter((path) => !existsSync(path))
   if (missing.length > 0) throw new Error('тесты не приехали в пакет: ' + missing.join(', ')
