@@ -27,6 +27,10 @@ const MIRROR_DIR = process.env.VERME_GATE_MIRROR_DIR || join(tmpdir(), 'dsh-verm
 const GITLAB_REMOTE = process.env.VERME_GATE_GITLAB_REMOTE || 'gitlab'
 const GITLAB_BRANCH = process.env.VERME_GATE_GITLAB_BRANCH || 'feat/dsh-verme-gate'
 const MIRROR_REMOTE = process.env.VERME_GATE_MIRROR_REMOTE || 'origin'
+const MIRROR_CLONE_URL = process.env.VERME_GATE_MIRROR_URL || 'git@github.com:irtokarkkeja/dsh-verme-gate-plugin.git'
+/** Автор коммита в клоне публикации: свежий клон не наследует identity монорепо. */
+const MIRROR_IDENTITY = ['-c', 'user.name=' + (process.env.VERME_GATE_MIRROR_NAME || 'seva'),
+  '-c', 'user.email=' + (process.env.VERME_GATE_MIRROR_EMAIL || 'sad@nesss.ru')]
 
 /** Разобрать argv: только те флаги, что описаны в шапке. */
 function parseArgs(argv) {
@@ -90,9 +94,14 @@ process.stdout.write('selftest: PASS\n')
 
 const commitMessage = 'verme-gate ' + next + ': ' + message
 run('git', ['add', '-A', 'plugins/dsh-mcp-access'], REPO_DIR)
-run('git', ['commit', '-m', commitMessage], REPO_DIR)
-const sha = run('git', ['rev-parse', '--short', 'HEAD'], REPO_DIR)
-process.stdout.write('коммит ' + sha + ' в монорепо\n')
+// Версия могла быть закоммичена прошлым запуском (--bump сделал коммит, публикация отдельным
+// вызовом): пустой git commit падал, и опубликовать уже готовый коммит было нельзя.
+if (run('git', ['status', '--porcelain', 'plugins/dsh-mcp-access'], REPO_DIR) === '') {
+  process.stdout.write('изменений нет: ' + next + ' уже закоммичена, публикую существующий коммит\n')
+} else {
+  run('git', ['commit', '-m', commitMessage], REPO_DIR)
+  process.stdout.write('коммит ' + run('git', ['rev-parse', '--short', 'HEAD'], REPO_DIR) + ' в монорепо\n')
+}
 
 if (!options.yes) {
   process.stdout.write('\nбез --yes пуш не делаю. Дальше руками:\n'
@@ -105,8 +114,11 @@ run('git', ['push', GITLAB_REMOTE, 'HEAD:' + GITLAB_BRANCH], REPO_DIR)
 process.stdout.write('пуш в ' + GITLAB_REMOTE + ':' + GITLAB_BRANCH + '\n')
 
 if (options.mirror) {
-  if (!existsSync(join(MIRROR_DIR, '.git'))) throw new Error('нет клона публикации: ' + MIRROR_DIR
-    + ' (git clone git@github.com:irtokarkkeja/dsh-verme-gate-plugin.git ' + MIRROR_DIR + ')')
+  if (!existsSync(join(MIRROR_DIR, '.git'))) {
+    // Клон живёт в /tmp и переживает не всё: без него публикация падала с просьбой склонировать руками.
+    process.stdout.write('клона публикации нет — клонирую ' + MIRROR_CLONE_URL + '\n')
+    run('git', ['clone', MIRROR_CLONE_URL, MIRROR_DIR], REPO_DIR)
+  }
   const files = ['index.js', 'cordis.patch.yml', 'package.json', 'README.md', 'page.html', 'selftest.mjs', 'lib', 'client', 'prompts', 'scripts', 'test']
   const dirs = ['lib', 'client', 'prompts', 'scripts', 'test']
   // Урок 0.3.21–0.3.24: `cp -a src/lib mirror/lib` при существующем mirror/lib кладёт каталог
@@ -133,9 +145,9 @@ if (options.mirror) {
   const nestedLeft = run('git', ['ls-files'], MIRROR_DIR).split('\n').filter((path) => /^(lib|client|scripts|prompts)\/\1\//.test(path))
   if (nestedLeft.length > 0) throw new Error('в зеркале вложенные дубли: ' + nestedLeft.slice(0, 5).join(', '))
   process.stdout.write('зеркало проверено: selftest PASS, клиент ' + next + ', дублей нет\n')
-  run('git', ['commit', '-m', 'verme-gate ' + next + ': ' + message], MIRROR_DIR)
+  run('git', [...MIRROR_IDENTITY, 'commit', '-m', 'verme-gate ' + next + ': ' + message], MIRROR_DIR)
   const tag = 'v' + next
-  run('git', ['tag', '-a', tag, '-m', 'verme-gate ' + next], MIRROR_DIR)
+  run('git', [...MIRROR_IDENTITY, 'tag', '-a', tag, '-m', 'verme-gate ' + next], MIRROR_DIR)
   run('git', ['push', MIRROR_REMOTE, 'HEAD:main', tag], MIRROR_DIR)
   process.stdout.write('зеркало: ' + MIRROR_DIR + ' → ' + MIRROR_REMOTE + ' main + тег ' + tag + '\n')
 }

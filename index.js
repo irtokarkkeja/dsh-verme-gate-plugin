@@ -281,6 +281,7 @@ const YAML = await import(pathToFileURL(hostResolve('yaml')).href)
 // Свой llm-маршрут: провайдер с ДИНАМИЧЕСКИМ каталогом моделей. Стриминг/ретраи/картинки берёт
 // на себя pi-ai + PiAiAdapter, плагин владеет только каталогом (права активного ключа).
 import { buildGatewayRoute } from './lib/gateway-route.js'
+import { readModelCapabilities } from './lib/model-modality.js'
 
 export const name = 'verme-gate'
 /** connection обязателен: без него ручки не имеют права работать (fail-closed, ревью P1-1). */
@@ -2401,21 +2402,14 @@ const sanitizeUpstream = (text) => String(text === undefined || text === null ? 
       for (const entry of entries) {
         const modelId = typeof entry.model_name === 'string' ? entry.model_name : ''
         if (modelId === '') continue
-        const params = entry.litellm_params !== null && typeof entry.litellm_params === 'object'
-          ? entry.litellm_params
-          : {}
-        const contextWindow = Number(params.max_input_tokens)
-        const maxTokens = Number(params.max_output_tokens)
-        const hasContext = Number.isFinite(contextWindow) && contextWindow > 0
-        const hasOutput = Number.isFinite(maxTokens) && maxTokens > 0
-        // Приём картинок: LiteLLM кладёт supports_vision в model_info (иногда в litellm_params).
-        // Без этого флага pi-ai объявляет модель текстовой и валит вложение с UNSUPPORTED_CONTENT.
-        const info = entry.model_info !== null && typeof entry.model_info === 'object' ? entry.model_info : {}
-        const vision = info.supports_vision === true || params.supports_vision === true
-        if (!hasContext && !hasOutput && !vision) continue
+        // Ёмкости и приём картинок: шлюз кладёт их в litellm_params и/или model_info (подробности —
+        // в lib/model-modality.js). Без флага картинок pi-ai объявляет модель текстовой и валит
+        // вложение с UNSUPPORTED_CONTENT, хотя шлюз картинки принимает.
+        const { contextWindow, maxTokens, vision } = readModelCapabilities(entry)
+        if (contextWindow === undefined && maxTokens === undefined && !vision) continue
         limits.set(modelId, {
-          ...(hasContext ? { contextWindow } : {}),
-          ...(hasOutput ? { maxTokens } : {}),
+          ...(contextWindow === undefined ? {} : { contextWindow }),
+          ...(maxTokens === undefined ? {} : { maxTokens }),
           ...(vision ? { vision: true } : {}),
         })
       }
